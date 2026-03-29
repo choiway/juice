@@ -25,6 +25,9 @@ pub fn compile(module_name: &str, program: &Program) -> String {
     output.push('\n');
     output.push_str(&erlang::function_def("main", &body));
     output.push('\n');
+    output.push('\n');
+    output.push_str(&erlang::to_string_helper());
+    output.push('\n');
 
     output
 }
@@ -56,6 +59,7 @@ fn compile_statement(stmt: &Statement) -> Option<String> {
     match stmt {
         Statement::ExpressionStatement(expr_stmt) => compile_expression(&expr_stmt.expression),
         Statement::VariableDeclaration(decl) => compile_var_declaration(decl),
+        Statement::IfStatement(if_stmt) => compile_if_statement(if_stmt),
         _ => None,
     }
 }
@@ -97,6 +101,7 @@ fn compile_expression(expr: &Expression) -> Option<String> {
         Expression::Identifier(ident) => Some(erlang::js_var_to_erlang(&ident.name)),
         Expression::BinaryExpression(bin) => compile_binary_expression(bin),
         Expression::ArrowFunctionExpression(arrow) => compile_arrow_function(arrow),
+        Expression::TemplateLiteral(template) => compile_template_literal(template),
         Expression::ParenthesizedExpression(paren) => compile_expression(&paren.expression),
         _ => None,
     }
@@ -123,7 +128,82 @@ fn compile_function_body(body: &FunctionBody) -> Option<String> {
     }
 }
 
+fn compile_if_statement(if_stmt: &IfStatement) -> Option<String> {
+    let condition = compile_expression(&if_stmt.test)?;
+    let consequent = compile_block_statement(&if_stmt.consequent)?;
+    let alternate = match &if_stmt.alternate {
+        Some(stmt) => compile_block_statement(stmt)?,
+        None => "ok".to_string(),
+    };
+    Some(erlang::case_expression(&condition, &consequent, &alternate))
+}
+
+fn compile_block_statement(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::BlockStatement(block) => {
+            let lines: Vec<String> = block.body.iter().filter_map(|s| compile_statement(s)).collect();
+            if lines.is_empty() {
+                Some("ok".to_string())
+            } else {
+                Some(lines.join(",\n            "))
+            }
+        }
+        Statement::IfStatement(if_stmt) => compile_if_statement(if_stmt),
+        _ => compile_statement(stmt),
+    }
+}
+
+fn compile_template_literal(template: &TemplateLiteral) -> Option<String> {
+    if template.expressions.is_empty() {
+        let text = &template.quasis[0].value.raw;
+        return Some(erlang::string_literal(text));
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    for (i, quasi) in template.quasis.iter().enumerate() {
+        let text = &quasi.value.raw;
+        if !text.is_empty() {
+            parts.push(erlang::string_literal(text));
+        }
+        if i < template.expressions.len() {
+            let expr = compile_expression(&template.expressions[i])?;
+            parts.push(erlang::to_string_call(&expr));
+        }
+    }
+
+    Some(format!("lists:flatten([{}])", parts.join(", ")))
+}
+
+fn is_string_concat(expr: &Expression) -> bool {
+    match expr {
+        Expression::StringLiteral(_) => true,
+        Expression::TemplateLiteral(_) => true,
+        Expression::BinaryExpression(bin) if bin.operator.as_str() == "+" => {
+            is_string_concat(&bin.left) || is_string_concat(&bin.right)
+        }
+        _ => false,
+    }
+}
+
+fn compile_string_operand(expr: &Expression) -> Option<String> {
+    let compiled = compile_expression(expr)?;
+    match expr {
+        Expression::StringLiteral(_) => Some(compiled),
+        Expression::TemplateLiteral(_) => Some(compiled),
+        Expression::BinaryExpression(bin) if bin.operator.as_str() == "+" => Some(compiled),
+        _ => Some(erlang::to_string_call(&compiled)),
+    }
+}
+
 fn compile_binary_expression(bin: &BinaryExpression) -> Option<String> {
+    if bin.operator.as_str() == "+"
+        && (is_string_concat(&bin.left) || is_string_concat(&bin.right))
+    {
+        let left = compile_string_operand(&bin.left)?;
+        let right = compile_string_operand(&bin.right)?;
+        return Some(format!("({left} ++ {right})"));
+    }
+
     let left = compile_expression(&bin.left)?;
     let erl_op = erlang::binary_op(bin.operator.as_str())?;
     let right = compile_expression(&bin.right)?;
@@ -185,9 +265,10 @@ mod tests {
 
     fn main_body(source: &str) -> String {
         let erl = compile_js(source);
-        // Extract the body between "main() ->\n    " and "."
-        let start = erl.find("main() ->\n    ").unwrap() + "main() ->\n    ".len();
-        let end = erl.len() - 2; // trim trailing ".\n"
+        let prefix = "main() ->\n    ";
+        let start = erl.find(prefix).unwrap() + prefix.len();
+        // Find the first ".\n" after main body (end of function)
+        let end = erl[start..].find(".\n").unwrap() + start;
         erl[start..end].to_string()
     }
 
@@ -399,6 +480,139 @@ mod tests {
                 "Inc = fun(X) ->\n        (X + 1)\n    end",
                 "io:format(\"~p~n\", [Inc(5)])"
             ]
+        );
+    }
+
+    // --- String concatenation ---
+
+    #[test]
+    fn string_concat_literal_plus_var() {
+        assert_eq!(
+            main_body("const name = \"beam\"\nconsole.log(\"hello \" + name)"),
+            "Name = \"beam\",\n    io:format(\"~p~n\", [(\"hello \" ++ juice_to_string(Name))])"
+        );
+    }
+
+    #[test]
+    fn string_concat_var_plus_literal() {
+        assert_eq!(
+            main_body("const name = \"hello\"\nconsole.log(name + \" world\")"),
+            "Name = \"hello\",\n    io:format(\"~p~n\", [(juice_to_string(Name) ++ \" world\")])"
+        );
+    }
+
+    #[test]
+    fn string_concat_two_literals() {
+        assert_eq!(
+            main_body("console.log(\"hello \" + \"world\")"),
+            "io:format(\"~p~n\", [(\"hello \" ++ \"world\")])"
+        );
+    }
+
+    // --- If/else ---
+
+    #[test]
+    fn if_statement_basic() {
+        assert_eq!(
+            main_body("const x = 1\nif (x === 1) { console.log(x) }"),
+            "X = 1,\n    case (X =:= 1) of\n        true ->\n            io:format(\"~p~n\", [X]);\n        false ->\n            ok\n    end"
+        );
+    }
+
+    #[test]
+    fn if_else_statement() {
+        assert_eq!(
+            main_body("const x = 1\nif (x === 1) { console.log(\"yes\") } else { console.log(\"no\") }"),
+            "X = 1,\n    case (X =:= 1) of\n        true ->\n            io:format(\"yes~n\");\n        false ->\n            io:format(\"no~n\")\n    end"
+        );
+    }
+
+    #[test]
+    fn if_else_if_chain() {
+        assert_eq!(
+            main_body("const x = 1\nif (x === 1) { console.log(\"one\") } else if (x === 2) { console.log(\"two\") }"),
+            "X = 1,\n    case (X =:= 1) of\n        true ->\n            io:format(\"one~n\");\n        false ->\n            case (X =:= 2) of\n        true ->\n            io:format(\"two~n\");\n        false ->\n            ok\n    end\n    end"
+        );
+    }
+
+    #[test]
+    fn if_multi_statement_body() {
+        assert_eq!(
+            main_body("const x = 1\nif (x > 0) { const y = x + 1\nconsole.log(y) }"),
+            "X = 1,\n    case (X > 0) of\n        true ->\n            Y = (X + 1),\n            io:format(\"~p~n\", [Y]);\n        false ->\n            ok\n    end"
+        );
+    }
+
+    // --- REPL: string concat and if/else ---
+
+    #[test]
+    fn repl_string_concat() {
+        assert_eq!(
+            repl_compile("console.log(\"hello \" + \"world\")"),
+            vec!["io:format(\"~p~n\", [(\"hello \" ++ \"world\")])"]
+        );
+    }
+
+    #[test]
+    fn repl_if_else() {
+        assert_eq!(
+            repl_compile("const x = 1\nif (x === 1) { console.log(\"yes\") } else { console.log(\"no\") }"),
+            vec![
+                "X = 1",
+                "case (X =:= 1) of\n        true ->\n            io:format(\"yes~n\");\n        false ->\n            io:format(\"no~n\")\n    end"
+            ]
+        );
+    }
+
+    // --- Chained string concatenation ---
+
+    #[test]
+    fn string_concat_chained() {
+        assert_eq!(
+            main_body("const x = \"w\"\nconsole.log(\"a\" + x + \"b\")"),
+            "X = \"w\",\n    io:format(\"~p~n\", [((\"a\" ++ juice_to_string(X)) ++ \"b\")])"
+        );
+    }
+
+    #[test]
+    fn string_concat_phase2_pattern() {
+        assert_eq!(
+            main_body("const i = 1\nconst msg = \"hi\"\nconsole.log(\"process \" + i + \" got: \" + msg)"),
+            "I = 1,\n    Msg = \"hi\",\n    io:format(\"~p~n\", [(((\"process \" ++ juice_to_string(I)) ++ \" got: \") ++ juice_to_string(Msg))])"
+        );
+    }
+
+    // --- Template literals ---
+
+    #[test]
+    fn template_literal_no_interpolation() {
+        assert_eq!(
+            main_body("console.log(`hello`)"),
+            "io:format(\"~p~n\", [\"hello\"])"
+        );
+    }
+
+    #[test]
+    fn template_literal_one_expr() {
+        assert_eq!(
+            main_body("const name = \"beam\"\nconsole.log(`hello ${name}`)"),
+            "Name = \"beam\",\n    io:format(\"~p~n\", [lists:flatten([\"hello \", juice_to_string(Name)])])"
+        );
+    }
+
+    #[test]
+    fn template_literal_multiple_expr() {
+        assert_eq!(
+            main_body("const a = 1\nconst b = 2\nconsole.log(`${a} + ${b}`)"),
+            "A = 1,\n    B = 2,\n    io:format(\"~p~n\", [lists:flatten([juice_to_string(A), \" + \", juice_to_string(B)])])"
+        );
+    }
+
+    #[test]
+    fn template_literal_in_arrow() {
+        assert_eq!(
+            main_body("const f = (x) => `val: ${x}`"),
+            "F = fun(X) ->\n        lists:flatten([\"val: \", juice_to_string(X)])\n    end"
         );
     }
 }

@@ -52,9 +52,28 @@ pub fn binary_expression(left: &str, op: &str, right: &str) -> String {
     format!("({left} {op} {right})")
 }
 
+pub fn case_expression(condition: &str, true_body: &str, false_body: &str) -> String {
+    format!(
+        "case {condition} of\n        true ->\n            {true_body};\n        false ->\n            {false_body}\n    end"
+    )
+}
+
 pub fn fun_expression(params: &[String], body: &str) -> String {
     let params_str = params.join(", ");
     format!("fun({params_str}) ->\n        {body}\n    end")
+}
+
+pub fn to_string_helper() -> String {
+    "juice_to_string(V) when is_integer(V) -> integer_to_list(V);\n\
+     juice_to_string(V) when is_float(V) -> float_to_list(V, [{decimals, 10}, compact]);\n\
+     juice_to_string(V) when is_atom(V) -> atom_to_list(V);\n\
+     juice_to_string(V) when is_list(V) -> V;\n\
+     juice_to_string(V) -> lists:flatten(io_lib:format(\"~p\", [V]))."
+        .to_string()
+}
+
+pub fn to_string_call(expr: &str) -> String {
+    format!("juice_to_string({expr})")
 }
 
 pub fn js_var_to_erlang(name: &str) -> String {
