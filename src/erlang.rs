@@ -16,11 +16,40 @@ pub fn io_format(text: &str) -> String {
 }
 
 pub fn io_format_expr(expr: &str) -> String {
-    format!("io:format(\"~s~n\", [{expr}])")
+    format!("io:format(\"~p~n\", [{expr}])")
 }
 
 pub fn string_literal(s: &str) -> String {
     format!("\"{}\"", escape_erlang_string(s))
+}
+
+pub fn number_literal(value: f64) -> String {
+    if value.fract() == 0.0 && value.is_finite() {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
+pub fn binary_op(op: &str) -> Option<&'static str> {
+    match op {
+        "+" => Some("+"),
+        "-" => Some("-"),
+        "*" => Some("*"),
+        "/" => Some("/"),
+        "%" => Some("rem"),
+        "===" => Some("=:="),
+        "!==" => Some("=/="),
+        "<" => Some("<"),
+        ">" => Some(">"),
+        "<=" => Some("=<"),
+        ">=" => Some(">="),
+        _ => None,
+    }
+}
+
+pub fn binary_expression(left: &str, op: &str, right: &str) -> String {
+    format!("({left} {op} {right})")
 }
 
 pub fn js_var_to_erlang(name: &str) -> String {

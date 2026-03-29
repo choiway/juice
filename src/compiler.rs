@@ -78,9 +78,19 @@ fn compile_expression(expr: &Expression) -> Option<String> {
     match expr {
         Expression::CallExpression(call) => compile_call(call),
         Expression::StringLiteral(s) => Some(erlang::string_literal(&s.value)),
+        Expression::NumericLiteral(n) => Some(erlang::number_literal(n.value)),
         Expression::Identifier(ident) => Some(erlang::js_var_to_erlang(&ident.name)),
+        Expression::BinaryExpression(bin) => compile_binary_expression(bin),
+        Expression::ParenthesizedExpression(paren) => compile_expression(&paren.expression),
         _ => None,
     }
+}
+
+fn compile_binary_expression(bin: &BinaryExpression) -> Option<String> {
+    let left = compile_expression(&bin.left)?;
+    let erl_op = erlang::binary_op(bin.operator.as_str())?;
+    let right = compile_expression(&bin.right)?;
+    Some(erlang::binary_expression(&left, erl_op, &right))
 }
 
 fn compile_call(call: &CallExpression) -> Option<String> {
@@ -115,4 +125,86 @@ fn is_console_log(call: &CallExpression) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    fn compile_js(source: &str) -> String {
+        let allocator = Allocator::default();
+        let source_type = SourceType::from_path("test.ts").unwrap();
+        let parsed = Parser::new(&allocator, source, source_type).parse();
+        assert!(parsed.errors.is_empty(), "Parse errors: {:?}", parsed.errors);
+        compile("test", &parsed.program)
+    }
+
+    fn main_body(source: &str) -> String {
+        let erl = compile_js(source);
+        // Extract the body between "main() ->\n    " and "."
+        let start = erl.find("main() ->\n    ").unwrap() + "main() ->\n    ".len();
+        let end = erl.len() - 2; // trim trailing ".\n"
+        erl[start..end].to_string()
+    }
+
+    #[test]
+    fn number_literal() {
+        assert_eq!(main_body("console.log(42)"), "io:format(\"~p~n\", [42])");
+    }
+
+    #[test]
+    fn float_literal() {
+        assert_eq!(main_body("console.log(3.14)"), "io:format(\"~p~n\", [3.14])");
+    }
+
+    #[test]
+    fn number_variable() {
+        assert_eq!(
+            main_body("const x = 10\nconsole.log(x)"),
+            "X = 10,\n    io:format(\"~p~n\", [X])"
+        );
+    }
+
+    #[test]
+    fn binary_addition() {
+        assert_eq!(
+            main_body("console.log(1 + 2)"),
+            "io:format(\"~p~n\", [(1 + 2)])"
+        );
+    }
+
+    #[test]
+    fn binary_comparison() {
+        assert_eq!(
+            main_body("console.log(1 === 2)"),
+            "io:format(\"~p~n\", [(1 =:= 2)])"
+        );
+    }
+
+    #[test]
+    fn less_equal_maps_to_erlang() {
+        assert_eq!(
+            main_body("console.log(1 <= 2)"),
+            "io:format(\"~p~n\", [(1 =< 2)])"
+        );
+    }
+
+    #[test]
+    fn nested_expression() {
+        assert_eq!(
+            main_body("console.log(1 + 2 * 3)"),
+            "io:format(\"~p~n\", [(1 + (2 * 3))])"
+        );
+    }
+
+    #[test]
+    fn string_literal_unchanged() {
+        assert_eq!(
+            main_body("console.log(\"hello\")"),
+            "io:format(\"hello~n\")"
+        );
+    }
 }
