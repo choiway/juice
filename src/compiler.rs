@@ -116,9 +116,18 @@ fn compile_expression(expr: &Expression) -> Option<String> {
         Expression::BinaryExpression(bin) => compile_binary_expression(bin),
         Expression::ArrowFunctionExpression(arrow) => compile_arrow_function(arrow),
         Expression::TemplateLiteral(template) => compile_template_literal(template),
+        Expression::ArrayExpression(array) => compile_array(array),
         Expression::ParenthesizedExpression(paren) => compile_expression(&paren.expression),
         _ => None,
     }
+}
+
+fn compile_array(array: &ArrayExpression) -> Option<String> {
+    let elements: Vec<String> = array.elements.iter().filter_map(|elem| {
+        let expr = elem.as_expression()?;
+        compile_expression(expr)
+    }).collect();
+    Some(erlang::tuple_literal(&elements))
 }
 
 fn compile_arrow_function(arrow: &ArrowFunctionExpression) -> Option<String> {
@@ -850,6 +859,56 @@ mod tests {
         assert_eq!(
             main_body("console.log(self())"),
             "io:format(\"~p~n\", [self()])"
+        );
+    }
+
+    // --- Tuples ---
+
+    #[test]
+    fn tuple_basic() {
+        assert_eq!(
+            main_body("const t = [1, 2, 3]"),
+            "T = {1, 2, 3}"
+        );
+    }
+
+    #[test]
+    fn tuple_mixed_types() {
+        assert_eq!(
+            main_body("const t = [1, \"hello\", 3]"),
+            "T = {1, hello, 3}"
+        );
+    }
+
+    #[test]
+    fn tuple_in_send() {
+        assert_eq!(
+            main_body("send(pid, [self(), \"hello\"])"),
+            "Pid ! {self(), hello}"
+        );
+    }
+
+    #[test]
+    fn tuple_with_variables() {
+        assert_eq!(
+            main_body("const x = 1\nconst t = [x, 2]"),
+            "X = 1,\n    T = {X, 2}"
+        );
+    }
+
+    #[test]
+    fn tuple_nested() {
+        assert_eq!(
+            main_body("const t = [1, [2, 3]]"),
+            "T = {1, {2, 3}}"
+        );
+    }
+
+    #[test]
+    fn tuple_empty() {
+        assert_eq!(
+            main_body("const t = []"),
+            "T = {}"
         );
     }
 

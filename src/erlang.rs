@@ -93,6 +93,10 @@ pub fn send_op(pid: &str, msg: &str) -> String {
     format!("{pid} ! {msg}")
 }
 
+pub fn tuple_literal(elements: &[String]) -> String {
+    format!("{{{}}}", elements.join(", "))
+}
+
 pub fn foreach_seq(var: &str, from: &str, to: &str, body: &str) -> String {
     format!("lists:foreach(fun({var}) ->\n        {body}\n    end, lists:seq({from}, {to}))")
 }
