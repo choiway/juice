@@ -63,6 +63,14 @@ pub fn fun_expression(params: &[String], body: &str) -> String {
     format!("fun({params_str}) ->\n        {body}\n    end")
 }
 
+pub fn spawn_call(fun_expr: &str) -> String {
+    format!("erlang:spawn({fun_expr})")
+}
+
+pub fn spawn_wait() -> String {
+    "timer:sleep(100)".to_string()
+}
+
 pub fn to_string_helper() -> String {
     "juice_to_string(V) when is_integer(V) -> integer_to_list(V);\n\
      juice_to_string(V) when is_float(V) -> float_to_list(V, [{decimals, 10}, compact]);\n\

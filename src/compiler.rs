@@ -11,10 +11,17 @@ pub fn compile(module_name: &str, program: &Program) -> String {
         }
     }
 
+    let uses_spawn = body_lines.iter().any(|line| line.contains("erlang:spawn("));
+
     let body = if body_lines.is_empty() {
         "ok".to_string()
     } else {
-        body_lines.join(",\n    ")
+        let joined = body_lines.join(",\n    ");
+        if uses_spawn {
+            format!("{joined},\n    {}", erlang::spawn_wait())
+        } else {
+            joined
+        }
     };
 
     let mut output = String::new();
@@ -220,6 +227,8 @@ fn compile_call(call: &CallExpression) -> Option<String> {
                 Some(erlang::io_format_expr(&expr))
             }
         }
+    } else if is_spawn(call) {
+        compile_spawn(call)
     } else if let Expression::Identifier(ident) = &call.callee {
         let func_name = erlang::js_var_to_erlang(&ident.name);
         let args: Vec<String> = call.arguments.iter().filter_map(|a| compile_argument(a)).collect();
@@ -237,6 +246,20 @@ fn compile_argument(arg: &Argument) -> Option<String> {
             compile_expression(expr)
         }
     }
+}
+
+fn is_spawn(call: &CallExpression) -> bool {
+    if let Expression::Identifier(ident) = &call.callee {
+        return ident.name == "spawn";
+    }
+    false
+}
+
+fn compile_spawn(call: &CallExpression) -> Option<String> {
+    let arg = call.arguments.first()?;
+    let expr = arg.as_expression()?;
+    let compiled_fn = compile_expression(expr)?;
+    Some(erlang::spawn_call(&compiled_fn))
 }
 
 fn is_console_log(call: &CallExpression) -> bool {
@@ -606,6 +629,56 @@ mod tests {
             main_body("const a = 1\nconst b = 2\nconsole.log(`${a} + ${b}`)"),
             "A = 1,\n    B = 2,\n    io:format(\"~p~n\", [lists:flatten([juice_to_string(A), \" + \", juice_to_string(B)])])"
         );
+    }
+
+    // --- Spawn ---
+
+    #[test]
+    fn spawn_basic() {
+        assert_eq!(
+            main_body("spawn(() => { console.log(\"hello\") })"),
+            "erlang:spawn(fun() ->\n        io:format(\"hello~n\")\n    end),\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn spawn_assigned_to_variable() {
+        assert_eq!(
+            main_body("const pid = spawn(() => { console.log(\"hello\") })"),
+            "Pid = erlang:spawn(fun() ->\n        io:format(\"hello~n\")\n    end),\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn spawn_multi_statement_body() {
+        assert_eq!(
+            main_body("spawn(() => { const x = 42\nconsole.log(x) })"),
+            "erlang:spawn(fun() ->\n        X = 42,\n        io:format(\"~p~n\", [X])\n    end),\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn spawn_followed_by_other_code() {
+        assert_eq!(
+            main_body("const pid = spawn(() => { console.log(\"bg\") })\nconsole.log(\"main\")"),
+            "Pid = erlang:spawn(fun() ->\n        io:format(\"bg~n\")\n    end),\n    io:format(\"main~n\"),\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn no_spawn_no_sleep() {
+        assert_eq!(
+            main_body("console.log(\"hello\")"),
+            "io:format(\"hello~n\")"
+        );
+    }
+
+    #[test]
+    fn spawn_full_module() {
+        let erl = compile_js("const pid = spawn(() => { console.log(\"hi\") })");
+        assert!(erl.contains("-module(test)."));
+        assert!(erl.contains("erlang:spawn("));
+        assert!(erl.contains("timer:sleep(100)"));
     }
 
     #[test]
