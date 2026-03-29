@@ -14,7 +14,7 @@ use oxc_span::SourceType;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: juice <file.js> or juice box");
+        eprintln!("Usage: juice <file.ts> or juice box");
         std::process::exit(1);
     }
 
@@ -34,9 +34,9 @@ fn main() {
         .and_then(|s| s.to_str())
         .unwrap_or("main");
 
-    // Parse JS
+    // Parse
     let allocator = Allocator::default();
-    let source_type = SourceType::mjs();
+    let source_type = SourceType::from_path(input_path).unwrap_or_else(|_| SourceType::mjs());
     let parser_return = Parser::new(&allocator, &source, source_type).parse();
 
     if !parser_return.errors.is_empty() {

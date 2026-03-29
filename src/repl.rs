@@ -33,7 +33,7 @@ pub fn run() {
         }
 
         let allocator = Allocator::default();
-        let source_type = SourceType::mjs();
+        let source_type = SourceType::from_path("repl.ts").unwrap();
         let parser_return = Parser::new(&allocator, trimmed, source_type).parse();
 
         if !parser_return.errors.is_empty() {
