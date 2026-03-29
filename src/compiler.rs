@@ -37,6 +37,21 @@ pub fn compile_stmt(stmt: &Statement) -> Option<String> {
     compile_statement(stmt)
 }
 
+pub fn compile_stmt_repl(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::ExpressionStatement(expr_stmt) => {
+            if let Expression::CallExpression(call) = &expr_stmt.expression {
+                if is_console_log(call) {
+                    return compile_expression(&expr_stmt.expression);
+                }
+            }
+            let compiled = compile_expression(&expr_stmt.expression)?;
+            Some(erlang::io_format_expr(&compiled))
+        }
+        _ => compile_statement(stmt),
+    }
+}
+
 fn compile_statement(stmt: &Statement) -> Option<String> {
     match stmt {
         Statement::ExpressionStatement(expr_stmt) => compile_expression(&expr_stmt.expression),
@@ -206,5 +221,43 @@ mod tests {
             main_body("console.log(\"hello\")"),
             "io:format(\"hello~n\")"
         );
+    }
+
+    fn repl_compile(source: &str) -> Vec<String> {
+        let allocator = Allocator::default();
+        let source_type = SourceType::from_path("repl.ts").unwrap();
+        let parsed = Parser::new(&allocator, source, source_type).parse();
+        assert!(parsed.errors.is_empty(), "Parse errors: {:?}", parsed.errors);
+        parsed
+            .program
+            .body
+            .iter()
+            .filter_map(|stmt| compile_stmt_repl(stmt))
+            .collect()
+    }
+
+    #[test]
+    fn repl_bare_expression_prints() {
+        assert_eq!(repl_compile("1 + 1"), vec!["io:format(\"~p~n\", [(1 + 1)])"]);
+    }
+
+    #[test]
+    fn repl_bare_identifier_prints() {
+        assert_eq!(repl_compile("const x = 10\nx"), vec!["X = 10", "io:format(\"~p~n\", [X])"]);
+    }
+
+    #[test]
+    fn repl_console_log_not_double_wrapped() {
+        assert_eq!(repl_compile("console.log(42)"), vec!["io:format(\"~p~n\", [42])"]);
+    }
+
+    #[test]
+    fn repl_console_log_string_not_double_wrapped() {
+        assert_eq!(repl_compile("console.log(\"hi\")"), vec!["io:format(\"hi~n\")"]);
+    }
+
+    #[test]
+    fn repl_var_declaration_no_wrapping() {
+        assert_eq!(repl_compile("const x = 10"), vec!["X = 10"]);
     }
 }

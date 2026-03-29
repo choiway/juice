@@ -47,7 +47,7 @@ pub fn run() {
 
         let mut exprs: Vec<String> = Vec::new();
         for stmt in &parser_return.program.body {
-            if let Some(erl) = compiler::compile_stmt(stmt) {
+            if let Some(erl) = compiler::compile_stmt_repl(stmt) {
                 exprs.push(erl);
             } else {
                 eprintln!("Unsupported statement");
@@ -65,7 +65,7 @@ pub fn run() {
             match output {
                 Ok(out) => {
                     if !out.stdout.is_empty() {
-                        print!("{}", String::from_utf8_lossy(&out.stdout));
+                        print!("\x1b[36m{}\x1b[0m", String::from_utf8_lossy(&out.stdout));
                     }
                     if !out.status.success() && !out.stderr.is_empty() {
                         eprint!("{}", String::from_utf8_lossy(&out.stderr));
