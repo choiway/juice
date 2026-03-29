@@ -126,6 +126,15 @@ fn compile_arrow_function(arrow: &ArrowFunctionExpression) -> Option<String> {
     Some(erlang::fun_expression(&params, &body))
 }
 
+fn compile_receive_body(body: &FunctionBody) -> Option<String> {
+    let lines: Vec<String> = body.statements.iter().filter_map(|s| compile_statement(s)).collect();
+    if lines.is_empty() {
+        Some("ok".to_string())
+    } else {
+        Some(lines.join(",\n                "))
+    }
+}
+
 fn compile_function_body(body: &FunctionBody) -> Option<String> {
     let lines: Vec<String> = body.statements.iter().filter_map(|s| compile_statement(s)).collect();
     if lines.is_empty() {
@@ -229,6 +238,12 @@ fn compile_call(call: &CallExpression) -> Option<String> {
         }
     } else if is_spawn(call) {
         compile_spawn(call)
+    } else if is_receive(call) {
+        compile_receive(call)
+    } else if is_send(call) {
+        compile_send(call)
+    } else if is_self(call) {
+        compile_self(call)
     } else if let Expression::Identifier(ident) = &call.callee {
         let func_name = erlang::js_var_to_erlang(&ident.name);
         let args: Vec<String> = call.arguments.iter().filter_map(|a| compile_argument(a)).collect();
@@ -253,6 +268,61 @@ fn is_spawn(call: &CallExpression) -> bool {
         return ident.name == "spawn";
     }
     false
+}
+
+fn is_self(call: &CallExpression) -> bool {
+    if let Expression::Identifier(ident) = &call.callee {
+        return ident.name == "self";
+    }
+    false
+}
+
+fn compile_self(_call: &CallExpression) -> Option<String> {
+    Some(erlang::self_call())
+}
+
+fn is_send(call: &CallExpression) -> bool {
+    if let Expression::Identifier(ident) = &call.callee {
+        return ident.name == "send";
+    }
+    false
+}
+
+fn compile_send(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 2 {
+        return None;
+    }
+    let pid_expr = compile_argument(&call.arguments[0])?;
+    let msg_expr = compile_argument(&call.arguments[1])?;
+    Some(erlang::send_op(&pid_expr, &msg_expr))
+}
+
+fn is_receive(call: &CallExpression) -> bool {
+    if let Expression::Identifier(ident) = &call.callee {
+        return ident.name == "receive";
+    }
+    false
+}
+
+fn compile_receive(call: &CallExpression) -> Option<String> {
+    let arg = call.arguments.first()?;
+    let expr = arg.as_expression()?;
+
+    if let Expression::ArrowFunctionExpression(arrow) = expr {
+        let pattern = if let Some(param) = arrow.params.items.first() {
+            match &param.pattern {
+                BindingPattern::BindingIdentifier(ident) => erlang::js_var_to_erlang(&ident.name),
+                _ => "_Msg".to_string(),
+            }
+        } else {
+            "_Msg".to_string()
+        };
+
+        let body = compile_receive_body(&arrow.body)?;
+        Some(erlang::receive_expression(&pattern, &body))
+    } else {
+        None
+    }
 }
 
 fn compile_spawn(call: &CallExpression) -> Option<String> {
@@ -662,6 +732,110 @@ mod tests {
         assert_eq!(
             main_body("const pid = spawn(() => { console.log(\"bg\") })\nconsole.log(\"main\")"),
             "Pid = erlang:spawn(fun() ->\n        io:format(\"bg~n\")\n    end),\n    io:format(\"main~n\"),\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn send_with_expression_message() {
+        assert_eq!(
+            main_body("const pid = spawn(() => { console.log(\"hi\") })\nsend(pid, 1 + 2)"),
+            "Pid = erlang:spawn(fun() ->\n        io:format(\"hi~n\")\n    end),\n    Pid ! (1 + 2),\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn send_with_self() {
+        assert_eq!(
+            main_body("const pid = spawn(() => { console.log(\"hi\") })\nsend(pid, self())"),
+            "Pid = erlang:spawn(fun() ->\n        io:format(\"hi~n\")\n    end),\n    Pid ! self(),\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn send_no_spawn_no_sleep() {
+        assert_eq!(
+            main_body("send(pid, \"hello\")"),
+            "Pid ! \"hello\""
+        );
+    }
+
+    // --- Self ---
+
+    #[test]
+    fn self_basic() {
+        assert_eq!(
+            main_body("console.log(self())"),
+            "io:format(\"~p~n\", [self()])"
+        );
+    }
+
+    // --- Receive ---
+
+    #[test]
+    fn receive_basic() {
+        assert_eq!(
+            main_body("spawn(() => { receive((msg) => { console.log(msg) }) })"),
+            "erlang:spawn(fun() ->\n        receive\n            Msg ->\n                io:format(\"~p~n\", [Msg])\n        end\n    end),\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn receive_multi_statement_body() {
+        assert_eq!(
+            main_body("spawn(() => { receive((msg) => { const x = msg\nconsole.log(x) }) })"),
+            "erlang:spawn(fun() ->\n        receive\n            Msg ->\n                X = Msg,\n                io:format(\"~p~n\", [X])\n        end\n    end),\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn receive_string_concat() {
+        assert_eq!(
+            main_body("spawn(() => { receive((msg) => { console.log(\"got: \" + msg) }) })"),
+            "erlang:spawn(fun() ->\n        receive\n            Msg ->\n                io:format(\"~p~n\", [(\"got: \" ++ juice_to_string(Msg))])\n        end\n    end),\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn receive_standalone() {
+        assert_eq!(
+            main_body("receive((msg) => { console.log(msg) })"),
+            "receive\n            Msg ->\n                io:format(\"~p~n\", [Msg])\n        end"
+        );
+    }
+
+    #[test]
+    fn receive_milestone_demo() {
+        assert_eq!(
+            main_body(
+                "const pid = spawn(() => { receive((msg) => { console.log(\"got: \" + msg) }) })\nsend(pid, \"hello from another process!\")"
+            ),
+            "Pid = erlang:spawn(fun() ->\n        receive\n            Msg ->\n                io:format(\"~p~n\", [(\"got: \" ++ juice_to_string(Msg))])\n        end\n    end),\n    Pid ! \"hello from another process!\",\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn receive_no_param() {
+        assert_eq!(
+            main_body("receive(() => { console.log(\"got something\") })"),
+            "receive\n            _Msg ->\n                io:format(\"got something~n\")\n        end"
+        );
+    }
+
+    // --- Send ---
+
+    #[test]
+    fn send_basic() {
+        assert_eq!(
+            main_body("const pid = spawn(() => { console.log(\"hi\") })\nsend(pid, \"hello\")"),
+            "Pid = erlang:spawn(fun() ->\n        io:format(\"hi~n\")\n    end),\n    Pid ! \"hello\",\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn self_assigned_to_variable() {
+        assert_eq!(
+            main_body("const me = self()\nconsole.log(me)"),
+            "Me = self(),\n    io:format(\"~p~n\", [Me])"
         );
     }
 

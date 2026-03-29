@@ -71,6 +71,18 @@ pub fn spawn_wait() -> String {
     "timer:sleep(100)".to_string()
 }
 
+pub fn self_call() -> String {
+    "self()".to_string()
+}
+
+pub fn send_op(pid: &str, msg: &str) -> String {
+    format!("{pid} ! {msg}")
+}
+
+pub fn receive_expression(pattern: &str, body: &str) -> String {
+    format!("receive\n            {pattern} ->\n                {body}\n        end")
+}
+
 pub fn to_string_helper() -> String {
     "juice_to_string(V) when is_integer(V) -> integer_to_list(V);\n\
      juice_to_string(V) when is_float(V) -> float_to_list(V, [{decimals, 10}, compact]);\n\
