@@ -79,6 +79,10 @@ pub fn send_op(pid: &str, msg: &str) -> String {
     format!("{pid} ! {msg}")
 }
 
+pub fn foreach_seq(var: &str, from: &str, to: &str, body: &str) -> String {
+    format!("lists:foreach(fun({var}) ->\n        {body}\n    end, lists:seq({from}, {to}))")
+}
+
 pub fn receive_expression(pattern: &str, body: &str) -> String {
     format!("receive\n            {pattern} ->\n                {body}\n        end")
 }

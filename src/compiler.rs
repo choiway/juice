@@ -67,6 +67,7 @@ fn compile_statement(stmt: &Statement) -> Option<String> {
         Statement::ExpressionStatement(expr_stmt) => compile_expression(&expr_stmt.expression),
         Statement::VariableDeclaration(decl) => compile_var_declaration(decl),
         Statement::IfStatement(if_stmt) => compile_if_statement(if_stmt),
+        Statement::ForStatement(for_stmt) => compile_for_statement(for_stmt),
         _ => None,
     }
 }
@@ -141,6 +142,73 @@ fn compile_function_body(body: &FunctionBody) -> Option<String> {
         Some("ok".to_string())
     } else {
         Some(lines.join(",\n        "))
+    }
+}
+
+fn compile_for_statement(for_stmt: &ForStatement) -> Option<String> {
+    // 1. Extract init variable name and start value
+    let (var_name, init_value) = match &for_stmt.init {
+        Some(ForStatementInit::VariableDeclaration(decl)) => {
+            let declarator = decl.declarations.first()?;
+            let name = match &declarator.id {
+                BindingPattern::BindingIdentifier(ident) => &ident.name,
+                _ => return None,
+            };
+            let value = compile_expression(declarator.init.as_ref()?)?;
+            (erlang::js_var_to_erlang(name), value)
+        }
+        _ => return None,
+    };
+
+    // 2. Extract limit from test expression (i < N or i <= N)
+    let test = for_stmt.test.as_ref()?;
+    let upper_bound = match test {
+        Expression::BinaryExpression(bin) => {
+            let op = bin.operator.as_str();
+            if op != "<" && op != "<=" {
+                return None;
+            }
+            let limit = compile_expression(&bin.right)?;
+            if op == "<" {
+                if let Ok(n) = limit.parse::<i64>() {
+                    format!("{}", n - 1)
+                } else {
+                    format!("({limit} - 1)")
+                }
+            } else {
+                limit
+            }
+        }
+        _ => return None,
+    };
+
+    // 3. Verify update is i++
+    match &for_stmt.update {
+        Some(Expression::UpdateExpression(update)) => {
+            if update.operator != UpdateOperator::Increment {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    // 4. Compile body
+    let body = compile_for_body(&for_stmt.body)?;
+
+    Some(erlang::foreach_seq(&var_name, &init_value, &upper_bound, &body))
+}
+
+fn compile_for_body(stmt: &Statement) -> Option<String> {
+    match stmt {
+        Statement::BlockStatement(block) => {
+            let lines: Vec<String> = block.body.iter().filter_map(|s| compile_statement(s)).collect();
+            if lines.is_empty() {
+                Some("ok".to_string())
+            } else {
+                Some(lines.join(",\n        "))
+            }
+        }
+        _ => compile_statement(stmt),
     }
 }
 
@@ -766,6 +834,56 @@ mod tests {
         assert_eq!(
             main_body("console.log(self())"),
             "io:format(\"~p~n\", [self()])"
+        );
+    }
+
+    // --- For loop ---
+
+    #[test]
+    fn for_loop_basic() {
+        assert_eq!(
+            main_body("for (let i = 0; i < 3; i++) { console.log(i) }"),
+            "lists:foreach(fun(I) ->\n        io:format(\"~p~n\", [I])\n    end, lists:seq(0, 2))"
+        );
+    }
+
+    #[test]
+    fn for_loop_multi_statement() {
+        assert_eq!(
+            main_body("for (let i = 0; i < 3; i++) { const x = i + 1\nconsole.log(x) }"),
+            "lists:foreach(fun(I) ->\n        X = (I + 1),\n        io:format(\"~p~n\", [X])\n    end, lists:seq(0, 2))"
+        );
+    }
+
+    #[test]
+    fn for_loop_variable_limit() {
+        assert_eq!(
+            main_body("const n = 10\nfor (let j = 0; j < n; j++) { console.log(j) }"),
+            "N = 10,\n    lists:foreach(fun(J) ->\n        io:format(\"~p~n\", [J])\n    end, lists:seq(0, (N - 1)))"
+        );
+    }
+
+    #[test]
+    fn for_loop_with_spawn() {
+        assert_eq!(
+            main_body("for (let i = 0; i < 3; i++) { spawn(() => { console.log(i) }) }"),
+            "lists:foreach(fun(I) ->\n        erlang:spawn(fun() ->\n        io:format(\"~p~n\", [I])\n    end)\n    end, lists:seq(0, 2)),\n    timer:sleep(100)"
+        );
+    }
+
+    #[test]
+    fn for_loop_lte() {
+        assert_eq!(
+            main_body("for (let i = 0; i <= 2; i++) { console.log(i) }"),
+            "lists:foreach(fun(I) ->\n        io:format(\"~p~n\", [I])\n    end, lists:seq(0, 2))"
+        );
+    }
+
+    #[test]
+    fn for_loop_spawn_receive() {
+        assert_eq!(
+            main_body("for (let i = 0; i < 3; i++) { spawn(() => { receive((msg) => { console.log(\"process \" + i + \" got: \" + msg) }) }) }"),
+            "lists:foreach(fun(I) ->\n        erlang:spawn(fun() ->\n        receive\n            Msg ->\n                io:format(\"~p~n\", [(((\"process \" ++ juice_to_string(I)) ++ \" got: \") ++ juice_to_string(Msg))])\n        end\n    end)\n    end, lists:seq(0, 2)),\n    timer:sleep(100)"
         );
     }
 
