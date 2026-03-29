@@ -52,6 +52,11 @@ pub fn binary_expression(left: &str, op: &str, right: &str) -> String {
     format!("({left} {op} {right})")
 }
 
+pub fn fun_expression(params: &[String], body: &str) -> String {
+    let params_str = params.join(", ");
+    format!("fun({params_str}) ->\n        {body}\n    end")
+}
+
 pub fn js_var_to_erlang(name: &str) -> String {
     let mut chars = name.chars();
     match chars.next() {

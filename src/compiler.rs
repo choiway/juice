@@ -96,8 +96,30 @@ fn compile_expression(expr: &Expression) -> Option<String> {
         Expression::NumericLiteral(n) => Some(erlang::number_literal(n.value)),
         Expression::Identifier(ident) => Some(erlang::js_var_to_erlang(&ident.name)),
         Expression::BinaryExpression(bin) => compile_binary_expression(bin),
+        Expression::ArrowFunctionExpression(arrow) => compile_arrow_function(arrow),
         Expression::ParenthesizedExpression(paren) => compile_expression(&paren.expression),
         _ => None,
+    }
+}
+
+fn compile_arrow_function(arrow: &ArrowFunctionExpression) -> Option<String> {
+    let params: Vec<String> = arrow.params.items.iter().filter_map(|param| {
+        match &param.pattern {
+            BindingPattern::BindingIdentifier(ident) => Some(erlang::js_var_to_erlang(&ident.name)),
+            _ => None,
+        }
+    }).collect();
+
+    let body = compile_function_body(&arrow.body)?;
+    Some(erlang::fun_expression(&params, &body))
+}
+
+fn compile_function_body(body: &FunctionBody) -> Option<String> {
+    let lines: Vec<String> = body.statements.iter().filter_map(|s| compile_statement(s)).collect();
+    if lines.is_empty() {
+        Some("ok".to_string())
+    } else {
+        Some(lines.join(",\n        "))
     }
 }
 
@@ -118,6 +140,10 @@ fn compile_call(call: &CallExpression) -> Option<String> {
                 Some(erlang::io_format_expr(&expr))
             }
         }
+    } else if let Expression::Identifier(ident) = &call.callee {
+        let func_name = erlang::js_var_to_erlang(&ident.name);
+        let args: Vec<String> = call.arguments.iter().filter_map(|a| compile_argument(a)).collect();
+        Some(format!("{}({})", func_name, args.join(", ")))
     } else {
         None
     }
@@ -259,5 +285,120 @@ mod tests {
     #[test]
     fn repl_var_declaration_no_wrapping() {
         assert_eq!(repl_compile("const x = 10"), vec!["X = 10"]);
+    }
+
+    #[test]
+    fn arrow_function_no_params() {
+        assert_eq!(
+            main_body("const f = () => { console.log(42) }"),
+            "F = fun() ->\n        io:format(\"~p~n\", [42])\n    end"
+        );
+    }
+
+    #[test]
+    fn arrow_function_one_param() {
+        assert_eq!(
+            main_body("const greet = (name) => { console.log(name) }"),
+            "Greet = fun(Name) ->\n        io:format(\"~p~n\", [Name])\n    end"
+        );
+    }
+
+    #[test]
+    fn arrow_function_multiple_params() {
+        assert_eq!(
+            main_body("const add = (a, b) => { console.log(a + b) }"),
+            "Add = fun(A, B) ->\n        io:format(\"~p~n\", [(A + B)])\n    end"
+        );
+    }
+
+    #[test]
+    fn arrow_function_expression_body() {
+        assert_eq!(
+            main_body("const inc = (x) => x + 1"),
+            "Inc = fun(X) ->\n        (X + 1)\n    end"
+        );
+    }
+
+    #[test]
+    fn arrow_function_multi_statement_body() {
+        assert_eq!(
+            main_body("const f = () => { const x = 1\nconsole.log(x) }"),
+            "F = fun() ->\n        X = 1,\n        io:format(\"~p~n\", [X])\n    end"
+        );
+    }
+
+    #[test]
+    fn arrow_function_empty_body() {
+        assert_eq!(
+            main_body("const f = () => {}"),
+            "F = fun() ->\n        ok\n    end"
+        );
+    }
+
+    #[test]
+    fn repl_arrow_function_var() {
+        assert_eq!(
+            repl_compile("const greet = (name) => { console.log(name) }"),
+            vec!["Greet = fun(Name) ->\n        io:format(\"~p~n\", [Name])\n    end"]
+        );
+    }
+
+    #[test]
+    fn function_call_no_args() {
+        assert_eq!(
+            main_body("const f = () => { console.log(42) }\nf()"),
+            "F = fun() ->\n        io:format(\"~p~n\", [42])\n    end,\n    F()"
+        );
+    }
+
+    #[test]
+    fn function_call_one_arg() {
+        assert_eq!(
+            main_body("const greet = (name) => { console.log(name) }\ngreet(\"hello\")"),
+            "Greet = fun(Name) ->\n        io:format(\"~p~n\", [Name])\n    end,\n    Greet(\"hello\")"
+        );
+    }
+
+    #[test]
+    fn function_call_multiple_args() {
+        assert_eq!(
+            main_body("const add = (a, b) => { console.log(a + b) }\nadd(1, 2)"),
+            "Add = fun(A, B) ->\n        io:format(\"~p~n\", [(A + B)])\n    end,\n    Add(1, 2)"
+        );
+    }
+
+    #[test]
+    fn function_call_with_expression_arg() {
+        assert_eq!(
+            main_body("const f = (x) => { console.log(x) }\nf(1 + 2)"),
+            "F = fun(X) ->\n        io:format(\"~p~n\", [X])\n    end,\n    F((1 + 2))"
+        );
+    }
+
+    #[test]
+    fn function_call_with_variable_arg() {
+        assert_eq!(
+            main_body("const x = 10\nconst f = (n) => { console.log(n) }\nf(x)"),
+            "X = 10,\n    F = fun(N) ->\n        io:format(\"~p~n\", [N])\n    end,\n    F(X)"
+        );
+    }
+
+    #[test]
+    fn console_log_nested_function_call() {
+        assert_eq!(
+            main_body("const inc = (x) => x + 1\nconsole.log(inc(5))"),
+            "Inc = fun(X) ->\n        (X + 1)\n    end,\n    io:format(\"~p~n\", [Inc(5)])"
+        );
+    }
+
+    #[test]
+    fn repl_function_call_auto_prints() {
+        assert_eq!(
+            repl_compile("const inc = (x) => x + 1\ninc(5)"),
+            vec![
+                "Inc = fun(X) ->\n        (X + 1)\n    end",
+                "io:format(\"~p~n\", [Inc(5)])"
+            ]
+        );
     }
 }
