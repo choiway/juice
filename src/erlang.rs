@@ -19,6 +19,20 @@ pub fn io_format_expr(expr: &str) -> String {
     format!("io:format(\"~p~n\", [{expr}])")
 }
 
+pub fn is_atom_string(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c == '_' => {
+            chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+pub fn atom_literal(s: &str) -> String {
+    s.to_string()
+}
+
 pub fn string_literal(s: &str) -> String {
     format!("\"{}\"", escape_erlang_string(s))
 }

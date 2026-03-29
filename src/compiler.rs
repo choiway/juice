@@ -104,7 +104,13 @@ fn compile_declarator(decl: &VariableDeclarator) -> Option<String> {
 fn compile_expression(expr: &Expression) -> Option<String> {
     match expr {
         Expression::CallExpression(call) => compile_call(call),
-        Expression::StringLiteral(s) => Some(erlang::string_literal(&s.value)),
+        Expression::StringLiteral(s) => {
+            if erlang::is_atom_string(&s.value) {
+                Some(erlang::atom_literal(&s.value))
+            } else {
+                Some(erlang::string_literal(&s.value))
+            }
+        }
         Expression::NumericLiteral(n) => Some(erlang::number_literal(n.value)),
         Expression::Identifier(ident) => Some(erlang::js_var_to_erlang(&ident.name)),
         Expression::BinaryExpression(bin) => compile_binary_expression(bin),
@@ -270,12 +276,16 @@ fn is_string_concat(expr: &Expression) -> bool {
 }
 
 fn compile_string_operand(expr: &Expression) -> Option<String> {
-    let compiled = compile_expression(expr)?;
     match expr {
-        Expression::StringLiteral(_) => Some(compiled),
-        Expression::TemplateLiteral(_) => Some(compiled),
-        Expression::BinaryExpression(bin) if bin.operator.as_str() == "+" => Some(compiled),
-        _ => Some(erlang::to_string_call(&compiled)),
+        Expression::StringLiteral(s) => Some(erlang::string_literal(&s.value)),
+        _ => {
+            let compiled = compile_expression(expr)?;
+            match expr {
+                Expression::TemplateLiteral(_) => Some(compiled),
+                Expression::BinaryExpression(bin) if bin.operator.as_str() == "+" => Some(compiled),
+                _ => Some(erlang::to_string_call(&compiled)),
+            }
+        }
     }
 }
 
@@ -323,7 +333,13 @@ fn compile_call(call: &CallExpression) -> Option<String> {
 
 fn compile_argument(arg: &Argument) -> Option<String> {
     match arg {
-        Argument::StringLiteral(s) => Some(erlang::string_literal(&s.value)),
+        Argument::StringLiteral(s) => {
+            if erlang::is_atom_string(&s.value) {
+                Some(erlang::atom_literal(&s.value))
+            } else {
+                Some(erlang::string_literal(&s.value))
+            }
+        }
         _ => {
             let expr = arg.as_expression()?;
             compile_expression(expr)
@@ -597,7 +613,7 @@ mod tests {
     fn function_call_one_arg() {
         assert_eq!(
             main_body("const greet = (name) => { console.log(name) }\ngreet(\"hello\")"),
-            "Greet = fun(Name) ->\n        io:format(\"~p~n\", [Name])\n    end,\n    Greet(\"hello\")"
+            "Greet = fun(Name) ->\n        io:format(\"~p~n\", [Name])\n    end,\n    Greet(hello)"
         );
     }
 
@@ -650,7 +666,7 @@ mod tests {
     fn string_concat_literal_plus_var() {
         assert_eq!(
             main_body("const name = \"beam\"\nconsole.log(\"hello \" + name)"),
-            "Name = \"beam\",\n    io:format(\"~p~n\", [(\"hello \" ++ juice_to_string(Name))])"
+            "Name = beam,\n    io:format(\"~p~n\", [(\"hello \" ++ juice_to_string(Name))])"
         );
     }
 
@@ -658,7 +674,7 @@ mod tests {
     fn string_concat_var_plus_literal() {
         assert_eq!(
             main_body("const name = \"hello\"\nconsole.log(name + \" world\")"),
-            "Name = \"hello\",\n    io:format(\"~p~n\", [(juice_to_string(Name) ++ \" world\")])"
+            "Name = hello,\n    io:format(\"~p~n\", [(juice_to_string(Name) ++ \" world\")])"
         );
     }
 
@@ -731,7 +747,7 @@ mod tests {
     fn string_concat_chained() {
         assert_eq!(
             main_body("const x = \"w\"\nconsole.log(\"a\" + x + \"b\")"),
-            "X = \"w\",\n    io:format(\"~p~n\", [((\"a\" ++ juice_to_string(X)) ++ \"b\")])"
+            "X = w,\n    io:format(\"~p~n\", [((\"a\" ++ juice_to_string(X)) ++ \"b\")])"
         );
     }
 
@@ -739,7 +755,7 @@ mod tests {
     fn string_concat_phase2_pattern() {
         assert_eq!(
             main_body("const i = 1\nconst msg = \"hi\"\nconsole.log(\"process \" + i + \" got: \" + msg)"),
-            "I = 1,\n    Msg = \"hi\",\n    io:format(\"~p~n\", [(((\"process \" ++ juice_to_string(I)) ++ \" got: \") ++ juice_to_string(Msg))])"
+            "I = 1,\n    Msg = hi,\n    io:format(\"~p~n\", [(((\"process \" ++ juice_to_string(I)) ++ \" got: \") ++ juice_to_string(Msg))])"
         );
     }
 
@@ -757,7 +773,7 @@ mod tests {
     fn template_literal_one_expr() {
         assert_eq!(
             main_body("const name = \"beam\"\nconsole.log(`hello ${name}`)"),
-            "Name = \"beam\",\n    io:format(\"~p~n\", [lists:flatten([\"hello \", juice_to_string(Name)])])"
+            "Name = beam,\n    io:format(\"~p~n\", [lists:flatten([\"hello \", juice_to_string(Name)])])"
         );
     }
 
@@ -823,7 +839,7 @@ mod tests {
     fn send_no_spawn_no_sleep() {
         assert_eq!(
             main_body("send(pid, \"hello\")"),
-            "Pid ! \"hello\""
+            "Pid ! hello"
         );
     }
 
@@ -834,6 +850,56 @@ mod tests {
         assert_eq!(
             main_body("console.log(self())"),
             "io:format(\"~p~n\", [self()])"
+        );
+    }
+
+    // --- Atoms ---
+
+    #[test]
+    fn atom_in_send() {
+        assert_eq!(
+            main_body("send(pid, \"hello\")"),
+            "Pid ! hello"
+        );
+    }
+
+    #[test]
+    fn non_atom_string_stays_string() {
+        assert_eq!(
+            main_body("send(pid, \"hello world\")"),
+            "Pid ! \"hello world\""
+        );
+    }
+
+    #[test]
+    fn atom_in_comparison() {
+        assert_eq!(
+            main_body("const x = \"hello\"\nif (x === \"hello\") { console.log(\"yes\") }"),
+            "X = hello,\n    case (X =:= hello) of\n        true ->\n            io:format(\"yes~n\");\n        false ->\n            ok\n    end"
+        );
+    }
+
+    #[test]
+    fn atom_string_concat_preserved() {
+        assert_eq!(
+            main_body("const name = \"beam\"\nconsole.log(\"hello \" + name)"),
+            "Name = beam,\n    io:format(\"~p~n\", [(\"hello \" ++ juice_to_string(Name))])"
+        );
+    }
+
+    #[test]
+    fn atom_in_function_call() {
+        assert_eq!(
+            main_body("const greet = (name) => { console.log(name) }\ngreet(\"hello\")"),
+            "Greet = fun(Name) ->\n        io:format(\"~p~n\", [Name])\n    end,\n    Greet(hello)"
+        );
+    }
+
+    #[test]
+    fn atom_in_variable() {
+        assert_eq!(
+            main_body("const x = \"hello\"\nconsole.log(x)"),
+            "X = hello,\n    io:format(\"~p~n\", [X])"
         );
     }
 
@@ -945,7 +1011,7 @@ mod tests {
     fn send_basic() {
         assert_eq!(
             main_body("const pid = spawn(() => { console.log(\"hi\") })\nsend(pid, \"hello\")"),
-            "Pid = erlang:spawn(fun() ->\n        io:format(\"hi~n\")\n    end),\n    Pid ! \"hello\",\n    timer:sleep(100)"
+            "Pid = erlang:spawn(fun() ->\n        io:format(\"hi~n\")\n    end),\n    Pid ! hello,\n    timer:sleep(100)"
         );
     }
 
