@@ -31,6 +31,10 @@ pub fn compile(module_name: &str, program: &Program) -> String {
     output
 }
 
+pub fn compile_expr(expr: &Expression) -> Option<String> {
+    compile_expression(expr)
+}
+
 fn compile_expression(expr: &Expression) -> Option<String> {
     match expr {
         Expression::CallExpression(call) => compile_call(call),

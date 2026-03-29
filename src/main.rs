@@ -1,5 +1,6 @@
 mod compiler;
 mod erlang;
+mod repl;
 
 use std::env;
 use std::fs;
@@ -13,8 +14,13 @@ use oxc_span::SourceType;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: juice <file.js>");
+        eprintln!("Usage: juice <file.js> or juice box");
         std::process::exit(1);
+    }
+
+    if args[1] == "box" {
+        repl::run();
+        return;
     }
 
     let input_path = Path::new(&args[1]);
