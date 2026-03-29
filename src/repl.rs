@@ -2,7 +2,7 @@ use std::io::{self, BufRead, Write};
 use std::process::Command;
 
 use oxc_allocator::Allocator;
-use oxc_ast::ast::Statement;
+
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
@@ -47,12 +47,8 @@ pub fn run() {
 
         let mut exprs: Vec<String> = Vec::new();
         for stmt in &parser_return.program.body {
-            if let Statement::ExpressionStatement(expr_stmt) = stmt {
-                if let Some(erl) = compiler::compile_expr(&expr_stmt.expression) {
-                    exprs.push(erl);
-                } else {
-                    eprintln!("Unsupported expression");
-                }
+            if let Some(erl) = compiler::compile_stmt(stmt) {
+                exprs.push(erl);
             } else {
                 eprintln!("Unsupported statement");
             }
