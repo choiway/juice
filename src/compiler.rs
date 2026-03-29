@@ -117,6 +117,8 @@ fn compile_expression(expr: &Expression) -> Option<String> {
         Expression::ArrowFunctionExpression(arrow) => compile_arrow_function(arrow),
         Expression::TemplateLiteral(template) => compile_template_literal(template),
         Expression::ArrayExpression(array) => compile_array(array),
+        Expression::ObjectExpression(obj) => compile_object(obj),
+        Expression::StaticMemberExpression(member) => compile_member_access(member),
         Expression::ParenthesizedExpression(paren) => compile_expression(&paren.expression),
         _ => None,
     }
@@ -128,6 +130,32 @@ fn compile_array(array: &ArrayExpression) -> Option<String> {
         compile_expression(expr)
     }).collect();
     Some(erlang::tuple_literal(&elements))
+}
+
+fn compile_object(obj: &ObjectExpression) -> Option<String> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+
+    for prop in &obj.properties {
+        match prop {
+            ObjectPropertyKind::ObjectProperty(p) => {
+                let key = match &p.key {
+                    PropertyKey::StaticIdentifier(ident) => ident.name.to_string(),
+                    _ => return None,
+                };
+                let value = compile_expression(&p.value)?;
+                entries.push((key, value));
+            }
+            _ => return None,
+        }
+    }
+
+    Some(erlang::map_literal(&entries))
+}
+
+fn compile_member_access(member: &StaticMemberExpression) -> Option<String> {
+    let object = compile_expression(&member.object)?;
+    let property = member.property.name.to_string();
+    Some(erlang::maps_get(&property, &object))
 }
 
 fn compile_arrow_function(arrow: &ArrowFunctionExpression) -> Option<String> {
@@ -1104,5 +1132,174 @@ mod tests {
             main_body("const f = (x) => `val: ${x}`"),
             "F = fun(X) ->\n        lists:flatten([\"val: \", juice_to_string(X)])\n    end"
         );
+    }
+
+    // === Object literals ===
+
+    #[test]
+    fn object_literal_basic() {
+        assert_eq!(
+            main_body("const state = { count: 0 }"),
+            "State = #{count => 0}"
+        );
+    }
+
+    #[test]
+    fn object_literal_multi_property() {
+        assert_eq!(
+            main_body("const obj = { a: 1, b: 2 }"),
+            "Obj = #{a => 1, b => 2}"
+        );
+    }
+
+    #[test]
+    fn object_literal_string_values() {
+        assert_eq!(
+            main_body("const obj = { name: \"hello\", status: \"ok\" }"),
+            "Obj = #{name => hello, status => ok}"
+        );
+    }
+
+    #[test]
+    fn object_literal_variable_values() {
+        assert_eq!(
+            main_body("const x = 42\nconst obj = { count: x }"),
+            "X = 42,\n    Obj = #{count => X}"
+        );
+    }
+
+    #[test]
+    fn object_literal_empty() {
+        assert_eq!(
+            main_body("const obj = {}"),
+            "Obj = #{}"
+        );
+    }
+
+    #[test]
+    fn object_literal_nested() {
+        assert_eq!(
+            main_body("const obj = { inner: { x: 1 } }"),
+            "Obj = #{inner => #{x => 1}}"
+        );
+    }
+
+    // === Property access ===
+
+    #[test]
+    fn property_access_basic() {
+        assert_eq!(
+            main_body("const state = { count: 0 }\nconsole.log(state.count)"),
+            "State = #{count => 0},\n    io:format(\"~p~n\", [maps:get(count, State)])"
+        );
+    }
+
+    #[test]
+    fn property_access_in_expression() {
+        assert_eq!(
+            main_body("const state = { count: 0 }\nconsole.log(state.count + 1)"),
+            "State = #{count => 0},\n    io:format(\"~p~n\", [(maps:get(count, State) + 1)])"
+        );
+    }
+
+    #[test]
+    fn property_access_assign() {
+        assert_eq!(
+            main_body("const state = { count: 0 }\nconst c = state.count"),
+            "State = #{count => 0},\n    C = maps:get(count, State)"
+        );
+    }
+
+    #[test]
+    fn property_access_nested() {
+        assert_eq!(
+            main_body("const state = { inner: { x: 1 } }\nconsole.log(state.inner.x)"),
+            "State = #{inner => #{x => 1}},\n    io:format(\"~p~n\", [maps:get(x, maps:get(inner, State))])"
+        );
+    }
+
+    #[test]
+    fn object_in_arrow_return() {
+        assert_eq!(
+            main_body("const init = () => ({ count: 0 })"),
+            "Init = fun() ->\n        #{count => 0}\n    end"
+        );
+    }
+
+    #[test]
+    fn object_genserver_style_return() {
+        assert_eq!(
+            main_body("const state = { count: 1 }\nconst result = { reply: state.count, state: state }"),
+            "State = #{count => 1},\n    Result = #{reply => maps:get(count, State), state => State}"
+        );
+    }
+
+    // === Atom key quoting edge cases ===
+
+    #[test]
+    fn object_camel_case_key_bare() {
+        // camelCase starts lowercase → valid bare atom
+        assert_eq!(
+            main_body("const m = { handleCall: 1, handleCast: 2 }"),
+            "M = #{handleCall => 1, handleCast => 2}"
+        );
+    }
+
+    #[test]
+    fn property_access_camel_case_key() {
+        assert_eq!(
+            main_body("const m = { handleCall: 1 }\nconsole.log(m.handleCall)"),
+            "M = #{handleCall => 1},\n    io:format(\"~p~n\", [maps:get(handleCall, M)])"
+        );
+    }
+
+    #[test]
+    fn object_uppercase_key_quoted() {
+        // PascalCase starts uppercase → must be single-quoted to avoid variable
+        assert_eq!(
+            main_body("const m = { MyKey: 1 }"),
+            "M = #{'MyKey' => 1}"
+        );
+    }
+
+    #[test]
+    fn property_access_uppercase_key_quoted() {
+        assert_eq!(
+            main_body("const m = { MyKey: 1 }\nconst v = m.MyKey"),
+            "M = #{'MyKey' => 1},\n    V = maps:get('MyKey', M)"
+        );
+    }
+
+    #[test]
+    fn object_dollar_key_quoted() {
+        assert_eq!(
+            main_body("const m = { $ref: 1 }"),
+            "M = #{'$ref' => 1}"
+        );
+    }
+
+    #[test]
+    fn object_underscore_key_quoted() {
+        // _foo in Erlang is a variable, not an atom — must quote
+        assert_eq!(
+            main_body("const m = { _private: 1 }"),
+            "M = #{'_private' => 1}"
+        );
+    }
+
+    // === to_string with maps ===
+
+    #[test]
+    fn string_concat_with_object() {
+        assert_eq!(
+            main_body("const s = { count: 0 }\nconsole.log(\"state: \" + s)"),
+            "S = #{count => 0},\n    io:format(\"~p~n\", [(\"state: \" ++ juice_to_string(S))])"
+        );
+    }
+
+    #[test]
+    fn to_string_helper_has_map_clause() {
+        let erl = compile_js("console.log(\"hi\")");
+        assert!(erl.contains("is_map(V)"));
     }
 }

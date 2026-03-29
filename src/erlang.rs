@@ -109,6 +109,7 @@ pub fn to_string_helper() -> String {
     "juice_to_string(V) when is_integer(V) -> integer_to_list(V);\n\
      juice_to_string(V) when is_float(V) -> float_to_list(V, [{decimals, 10}, compact]);\n\
      juice_to_string(V) when is_atom(V) -> atom_to_list(V);\n\
+     juice_to_string(V) when is_map(V) -> lists:flatten(io_lib:format(\"~p\", [V]));\n\
      juice_to_string(V) when is_list(V) -> V;\n\
      juice_to_string(V) -> lists:flatten(io_lib:format(\"~p\", [V]))."
         .to_string()
@@ -124,6 +125,43 @@ pub fn js_var_to_erlang(name: &str) -> String {
         Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
         None => String::new(),
     }
+}
+
+/// Check if a string is a valid unquoted Erlang atom.
+/// Erlang rule: starts with lowercase letter, rest is alphanumeric, `_`, or `@`.
+pub fn is_unquoted_atom(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '@')
+        }
+        _ => false,
+    }
+}
+
+/// Emit an atom suitable for use as a map key.
+/// Bare if valid unquoted, single-quoted otherwise.
+pub fn atom_key(name: &str) -> String {
+    if is_unquoted_atom(name) {
+        name.to_string()
+    } else {
+        format!("'{}'", name.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+}
+
+pub fn map_literal(entries: &[(String, String)]) -> String {
+    if entries.is_empty() {
+        return "#{}".to_string();
+    }
+    let pairs: Vec<String> = entries
+        .iter()
+        .map(|(key, value)| format!("{} => {}", atom_key(key), value))
+        .collect();
+    format!("#{{{}}}", pairs.join(", "))
+}
+
+pub fn maps_get(key: &str, map: &str) -> String {
+    format!("maps:get({}, {map})", atom_key(key))
 }
 
 fn escape_erlang_string(s: &str) -> String {
