@@ -11,19 +11,56 @@ use oxc_allocator::Allocator;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
+const VERSION: &str = "0.1.0";
+
+struct Flags {
+    emit_erl: bool,
+    run: bool,
+}
+
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: juice <file.ts> or juice box");
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    if args.is_empty() {
+        print_usage();
         std::process::exit(1);
     }
 
-    if args[1] == "box" {
-        repl::run();
-        return;
+    // Parse flags and collect positional args
+    let mut flags = Flags {
+        emit_erl: false,
+        run: false,
+    };
+    let mut positional: Vec<&str> = Vec::new();
+
+    for arg in &args {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                return;
+            }
+            "--version" | "-v" => {
+                println!("juice {VERSION}");
+                return;
+            }
+            "--emit-erl" => flags.emit_erl = true,
+            "--run" => flags.run = true,
+            _ => positional.push(arg),
+        }
     }
 
-    let input_path = Path::new(&args[1]);
+    if positional.is_empty() {
+        print_usage();
+        std::process::exit(1);
+    }
+
+    match positional[0] {
+        "box" => repl::run(),
+        path => compile_file(Path::new(path), &flags),
+    }
+}
+
+fn compile_file(input_path: &Path, flags: &Flags) {
     let source = fs::read_to_string(input_path).unwrap_or_else(|e| {
         eprintln!("Error reading {}: {e}", input_path.display());
         std::process::exit(1);
@@ -49,6 +86,10 @@ fn main() {
     // Compile to Erlang
     let erl_source = compiler::compile(module_name, &parser_return.program);
 
+    if flags.emit_erl {
+        print!("{erl_source}");
+    }
+
     // Write .erl file
     let erl_path = format!("{module_name}.erl");
     fs::write(&erl_path, &erl_source).unwrap_or_else(|e| {
@@ -73,4 +114,33 @@ fn main() {
     }
 
     println!("Compiled {module_name}.beam");
+
+    // Run if requested
+    if flags.run {
+        let status = Command::new("erl")
+            .args(["-noshell", "-s", module_name, "main", "-s", "init", "stop"])
+            .status()
+            .unwrap_or_else(|e| {
+                eprintln!("Error running erl: {e}");
+                std::process::exit(1);
+            });
+
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+}
+
+fn print_usage() {
+    eprintln!("juice {VERSION} - JavaScript to BEAM compiler");
+    eprintln!();
+    eprintln!("Usage:");
+    eprintln!("  juice <file>              Compile to .beam");
+    eprintln!("  juice <file> --emit-erl   Also print generated Erlang");
+    eprintln!("  juice <file> --run        Compile and execute");
+    eprintln!("  juice box                 Interactive REPL");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  -h, --help                Print this help");
+    eprintln!("  -v, --version             Print version");
 }
