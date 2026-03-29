@@ -84,15 +84,35 @@ fn compile_file(input_path: &Path, flags: &Flags) {
     }
 
     // Compile to Erlang
-    let erl_source = compiler::compile(module_name, &parser_return.program);
+    let result = compiler::compile(module_name, &parser_return.program);
 
     if flags.emit_erl {
-        print!("{erl_source}");
+        print!("{}", result.source);
+    }
+
+    // Write and compile supervisor runtime module if needed
+    if result.needs_supervisor {
+        let sup_source = erlang::supervisor_module();
+        fs::write("juice_supervisor.erl", &sup_source).unwrap_or_else(|e| {
+            eprintln!("Error writing juice_supervisor.erl: {e}");
+            std::process::exit(1);
+        });
+        let status = Command::new("erlc")
+            .arg("juice_supervisor.erl")
+            .status()
+            .unwrap_or_else(|e| {
+                eprintln!("Error running erlc: {e}");
+                std::process::exit(1);
+            });
+        if !status.success() {
+            eprintln!("erlc failed on juice_supervisor.erl");
+            std::process::exit(1);
+        }
     }
 
     // Write .erl file
     let erl_path = format!("{module_name}.erl");
-    fs::write(&erl_path, &erl_source).unwrap_or_else(|e| {
+    fs::write(&erl_path, &result.source).unwrap_or_else(|e| {
         eprintln!("Error writing {erl_path}: {e}");
         std::process::exit(1);
     });

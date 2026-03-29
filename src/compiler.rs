@@ -8,18 +8,31 @@ struct GenServerDef<'a> {
     handle_cast: Option<(&'a FormalParameters<'a>, &'a FunctionBody<'a>)>,
 }
 
-pub fn compile(module_name: &str, program: &Program) -> String {
-    // Pass 1: detect GenServer definitions
+pub struct CompileResult {
+    pub source: String,
+    pub needs_supervisor: bool,
+}
+
+pub fn compile(module_name: &str, program: &Program) -> CompileResult {
+    // Pass 1: detect GenServer definitions and supervisor usage
     let mut genserver: Option<GenServerDef> = None;
     let mut genserver_stmt_index: Option<usize> = None;
+    let mut needs_supervisor = false;
 
     for (i, stmt) in program.body.iter().enumerate() {
         if let Statement::VariableDeclaration(decl) = stmt {
-            if let Some(gs) = detect_genserver(decl) {
-                genserver = Some(gs);
-                genserver_stmt_index = Some(i);
-                break;
+            if genserver.is_none() {
+                if let Some(gs) = detect_genserver(decl) {
+                    genserver = Some(gs);
+                    genserver_stmt_index = Some(i);
+                }
             }
+            // Check if initializer contains Supervisor.start
+            if detect_supervisor_usage(stmt) {
+                needs_supervisor = true;
+            }
+        } else if detect_supervisor_usage(stmt) {
+            needs_supervisor = true;
         }
     }
 
@@ -30,7 +43,7 @@ pub fn compile(module_name: &str, program: &Program) -> String {
         if Some(i) == genserver_stmt_index {
             continue;
         }
-        if let Some(line) = compile_statement(stmt) {
+        if let Some(line) = compile_statement_in_main(stmt, needs_supervisor) {
             body_lines.push(line);
         }
     }
@@ -55,9 +68,13 @@ pub fn compile(module_name: &str, program: &Program) -> String {
     if genserver.is_some() {
         output.push_str(&erlang::behaviour_attribute("gen_server"));
         output.push('\n');
-        output.push_str(&erlang::export_attribute(&[
+        let mut exports: Vec<(&str, usize)> = vec![
             ("main", 0), ("init", 1), ("handle_call", 3), ("handle_cast", 2), ("handle_info", 2),
-        ]));
+        ];
+        if needs_supervisor {
+            exports.push(("juice_gen_server_start_link", 1));
+        }
+        output.push_str(&erlang::export_attribute(&exports));
     } else {
         output.push_str(&erlang::export_attribute(&[("main", 0)]));
     }
@@ -89,9 +106,17 @@ pub fn compile(module_name: &str, program: &Program) -> String {
         output.push('\n');
         output.push_str(&erlang::gen_server_start_helper());
         output.push('\n');
+        if needs_supervisor {
+            output.push('\n');
+            output.push_str(&erlang::gen_server_start_link_helper());
+            output.push('\n');
+        }
     }
 
-    output
+    CompileResult {
+        source: output,
+        needs_supervisor,
+    }
 }
 
 pub fn compile_expr(expr: &Expression) -> Option<String> {
@@ -100,6 +125,31 @@ pub fn compile_expr(expr: &Expression) -> Option<String> {
 
 pub fn compile_stmt(stmt: &Statement) -> Option<String> {
     compile_statement(stmt)
+}
+
+/// Pre-scan: does this statement contain a Supervisor.start call?
+fn detect_supervisor_usage(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::VariableDeclaration(decl) => {
+            decl.declarations.iter().any(|d| {
+                d.init.as_ref().is_some_and(|expr| {
+                    if let Expression::CallExpression(call) = expr {
+                        is_supervisor_start(call)
+                    } else {
+                        false
+                    }
+                })
+            })
+        }
+        Statement::ExpressionStatement(expr_stmt) => {
+            if let Expression::CallExpression(call) = &expr_stmt.expression {
+                is_supervisor_start(call)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 fn detect_genserver<'a>(decl: &'a VariableDeclaration<'a>) -> Option<GenServerDef<'a>> {
@@ -191,6 +241,22 @@ pub fn compile_stmt_repl(stmt: &Statement) -> Option<String> {
     }
 }
 
+/// Compile a statement in main/0 context, with optional catch wrapping for
+/// bare GenServer.call when supervision is active.
+fn compile_statement_in_main(stmt: &Statement, uses_supervisor: bool) -> Option<String> {
+    if uses_supervisor {
+        if let Statement::ExpressionStatement(expr_stmt) = stmt {
+            if let Expression::CallExpression(call) = &expr_stmt.expression {
+                if is_genserver_call(call) {
+                    let compiled = compile_genserver_call(call)?;
+                    return Some(format!("(catch {compiled})"));
+                }
+            }
+        }
+    }
+    compile_statement(stmt)
+}
+
 fn compile_statement(stmt: &Statement) -> Option<String> {
     match stmt {
         Statement::ExpressionStatement(expr_stmt) => compile_expression(&expr_stmt.expression),
@@ -198,6 +264,7 @@ fn compile_statement(stmt: &Statement) -> Option<String> {
         Statement::IfStatement(if_stmt) => compile_if_statement(if_stmt),
         Statement::ForStatement(for_stmt) => compile_for_statement(for_stmt),
         Statement::ReturnStatement(ret) => compile_return_statement(ret),
+        Statement::ThrowStatement(throw_stmt) => compile_throw_statement(throw_stmt),
         _ => None,
     }
 }
@@ -223,6 +290,29 @@ fn compile_return_statement(ret: &ReturnStatement) -> Option<String> {
         Some(expr) => compile_expression(expr),
         None => Some("ok".to_string()),
     }
+}
+
+fn compile_throw_statement(throw_stmt: &ThrowStatement) -> Option<String> {
+    // Match: throw new Error("message")
+    if let Expression::NewExpression(new_expr) = &throw_stmt.argument {
+        if let Expression::Identifier(ident) = &new_expr.callee {
+            if ident.name == "Error" {
+                if let Some(arg) = new_expr.arguments.first() {
+                    if let Argument::StringLiteral(s) = arg {
+                        return Some(erlang::erlang_error(&s.value));
+                    }
+                    // Dynamic expression: throw new Error(expr)
+                    let compiled = compile_argument(arg)?;
+                    return Some(erlang::erlang_error_expr(&compiled));
+                }
+                // throw new Error() with no message
+                return Some(erlang::erlang_error("error"));
+            }
+        }
+    }
+    // Fallback: throw <expr>
+    let compiled = compile_expression(&throw_stmt.argument)?;
+    Some(erlang::erlang_error_expr(&compiled))
 }
 
 fn compile_declarator(decl: &VariableDeclarator) -> Option<String> {
@@ -494,6 +584,14 @@ fn compile_call(call: &CallExpression) -> Option<String> {
         compile_genserver_call(call)
     } else if is_genserver_cast(call) {
         compile_genserver_cast(call)
+    } else if is_supervisor_start(call) {
+        compile_supervisor_start(call)
+    } else if is_supervisor_find_child(call) {
+        compile_supervisor_find_child(call)
+    } else if is_supervisor_which_children(call) {
+        compile_supervisor_which_children(call)
+    } else if is_process_exit(call) {
+        compile_process_exit(call)
     } else if is_spawn(call) {
         compile_spawn(call)
     } else if is_receive(call) {
@@ -645,6 +743,159 @@ fn compile_genserver_cast(call: &CallExpression) -> Option<String> {
     Some(erlang::gen_server_cast(&pid, &msg))
 }
 
+fn is_supervisor_start(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "Supervisor" && member.property.name == "start";
+        }
+    }
+    false
+}
+
+fn compile_supervisor_start(call: &CallExpression) -> Option<String> {
+    let arg = call.arguments.first()?;
+    let expr = arg.as_expression()?;
+    let obj = match expr {
+        Expression::ObjectExpression(obj) => obj,
+        _ => return None,
+    };
+
+    let mut strategy = "one_for_one".to_string();
+    let mut children_expr = None;
+
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop {
+            let key = match &p.key {
+                PropertyKey::StaticIdentifier(ident) => ident.name.as_str(),
+                _ => continue,
+            };
+            match key {
+                "strategy" => {
+                    if let Expression::StringLiteral(s) = &p.value {
+                        strategy = s.value.to_string();
+                    }
+                }
+                "children" => {
+                    children_expr = Some(&p.value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let children_erl = compile_child_specs(children_expr?)?;
+    let sup_flags = format!("#{{strategy => {strategy}, intensity => 3, period => 5}}");
+
+    Some(format!(
+        "element(2, juice_supervisor:start_link({sup_flags}, [{children_erl}]))"
+    ))
+}
+
+fn compile_child_specs(expr: &Expression) -> Option<String> {
+    let array = match expr {
+        Expression::ArrayExpression(arr) => arr,
+        _ => return None,
+    };
+
+    let specs: Vec<String> = array
+        .elements
+        .iter()
+        .filter_map(|elem| {
+            let expr = elem.as_expression()?;
+            compile_child_spec(expr)
+        })
+        .collect();
+
+    Some(specs.join(", "))
+}
+
+fn compile_child_spec(expr: &Expression) -> Option<String> {
+    let obj = match expr {
+        Expression::ObjectExpression(obj) => obj,
+        _ => return None,
+    };
+
+    let mut id = None;
+
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop {
+            let key = match &p.key {
+                PropertyKey::StaticIdentifier(ident) => ident.name.as_str(),
+                _ => continue,
+            };
+            if key == "id" {
+                if let Expression::StringLiteral(s) = &p.value {
+                    id = Some(s.value.to_string());
+                }
+            }
+        }
+    }
+
+    let id_str = id?;
+    let id_erl = if erlang::is_atom_string(&id_str) {
+        erlang::atom_literal(&id_str)
+    } else {
+        erlang::string_literal(&id_str)
+    };
+
+    Some(format!(
+        "#{{id => {id_erl}, start => {{?MODULE, juice_gen_server_start_link, [?MODULE]}}, restart => permanent, type => worker}}"
+    ))
+}
+
+fn is_supervisor_find_child(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "Supervisor" && member.property.name == "findChild";
+        }
+    }
+    false
+}
+
+fn compile_supervisor_find_child(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 2 {
+        return None;
+    }
+    let sup = compile_argument(&call.arguments[0])?;
+    let id = compile_argument(&call.arguments[1])?;
+    Some(format!("juice_supervisor:find_child({sup}, {id})"))
+}
+
+fn is_supervisor_which_children(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "Supervisor" && member.property.name == "whichChildren";
+        }
+    }
+    false
+}
+
+fn compile_supervisor_which_children(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 1 {
+        return None;
+    }
+    let sup = compile_argument(&call.arguments[0])?;
+    Some(format!("supervisor:which_children({sup})"))
+}
+
+fn is_process_exit(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "Process" && member.property.name == "exit";
+        }
+    }
+    false
+}
+
+fn compile_process_exit(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 2 {
+        return None;
+    }
+    let pid = compile_argument(&call.arguments[0])?;
+    let reason = compile_argument(&call.arguments[1])?;
+    Some(format!("erlang:exit({pid}, {reason})"))
+}
+
 fn is_console_log(call: &CallExpression) -> bool {
     if let Expression::StaticMemberExpression(member) = &call.callee {
         if let Expression::Identifier(obj) = &member.object {
@@ -666,7 +917,7 @@ mod tests {
         let source_type = SourceType::from_path("test.ts").unwrap();
         let parsed = Parser::new(&allocator, source, source_type).parse();
         assert!(parsed.errors.is_empty(), "Parse errors: {:?}", parsed.errors);
-        compile("test", &parsed.program)
+        compile("test", &parsed.program).source
     }
 
     fn main_body(source: &str) -> String {
@@ -1525,6 +1776,7 @@ mod tests {
 
     #[test]
     fn genserver_call_compiles() {
+        // Without supervision, bare GenServer.call is NOT caught
         assert_eq!(
             main_body("GenServer.call(pid, \"increment\")"),
             "gen_server:call(Pid, increment)"
@@ -1674,5 +1926,145 @@ mod tests {
         assert!(!erl.contains("-behaviour"), "non-genserver should have no behaviour");
         assert!(!erl.contains("init/1"), "non-genserver should have no init export");
         assert!(!erl.contains("juice_gen_server_start"), "non-genserver should have no start helper");
+    }
+
+    // === Phase 4: Supervision ===
+
+    #[test]
+    fn throw_new_error() {
+        assert_eq!(
+            main_body("throw new Error(\"crash!\")"),
+            "erlang:error({error, <<\"crash!\">>})"
+        );
+    }
+
+    #[test]
+    fn throw_new_error_no_message() {
+        assert_eq!(
+            main_body("throw new Error()"),
+            "erlang:error({error, <<\"error\">>})"
+        );
+    }
+
+    #[test]
+    fn supervisor_start_basic() {
+        let source = r#"Supervisor.start({
+            strategy: "one_for_one",
+            children: [
+                { id: "counter", start: () => GenServer.start(Counter) }
+            ]
+        })"#;
+        let body = main_body(source);
+        assert!(body.contains("element(2, juice_supervisor:start_link("), "should unwrap {{ok, Pid}}");
+        assert!(body.contains("strategy => one_for_one"), "should have strategy");
+        assert!(body.contains("intensity => 3"), "should have intensity 3");
+        assert!(body.contains("id => counter"), "should have child id");
+        assert!(body.contains("start => {?MODULE, juice_gen_server_start_link, [?MODULE]}"), "should have MFA");
+    }
+
+    #[test]
+    fn supervisor_find_child() {
+        assert_eq!(
+            main_body("Supervisor.findChild(sup, \"counter\")"),
+            "juice_supervisor:find_child(Sup, counter)"
+        );
+    }
+
+    #[test]
+    fn supervisor_which_children() {
+        assert_eq!(
+            main_body("Supervisor.whichChildren(sup)"),
+            "supervisor:which_children(Sup)"
+        );
+    }
+
+    #[test]
+    fn process_exit() {
+        assert_eq!(
+            main_body("Process.exit(pid, \"kill\")"),
+            "erlang:exit(Pid, kill)"
+        );
+    }
+
+    #[test]
+    fn genserver_call_bare_statement_caught() {
+        // With supervision present, bare GenServer.call is caught
+        let source = r#"
+            const sup = Supervisor.start({
+                strategy: "one_for_one",
+                children: [{ id: "w", start: () => GenServer.start(W) }]
+            })
+            GenServer.call(pid, "boom")
+        "#;
+        let body = main_body(source);
+        assert!(body.contains("(catch gen_server:call(Pid, boom))"), "should wrap in catch: {body}");
+    }
+
+    #[test]
+    fn genserver_call_in_assignment_not_caught() {
+        let body = main_body("const result = GenServer.call(pid, \"get\")");
+        assert_eq!(body, "Result = gen_server:call(Pid, get)");
+    }
+
+    #[test]
+    fn genserver_call_in_console_log_not_caught() {
+        let body = main_body("console.log(GenServer.call(pid, \"get\"))");
+        assert_eq!(body, "io:format(\"~p~n\", [gen_server:call(Pid, get)])");
+    }
+
+    #[test]
+    fn supervisor_module_exports_start_link() {
+        let source = r#"
+            const Counter = {
+                init: () => ({ count: 0 }),
+                handleCall: (msg, state) => {
+                    return { reply: state.count, state: state }
+                }
+            }
+            const sup = Supervisor.start({
+                strategy: "one_for_one",
+                children: [
+                    { id: "counter", start: () => GenServer.start(Counter) }
+                ]
+            })
+        "#;
+        let erl = compile_js(source);
+        assert!(erl.contains("juice_gen_server_start_link/1"), "should export start_link");
+        assert!(erl.contains("juice_gen_server_start_link(Module) ->"), "should have start_link helper");
+    }
+
+    #[test]
+    fn supervisor_strategy_one_for_all() {
+        let source = r#"Supervisor.start({
+            strategy: "one_for_all",
+            children: [
+                { id: "worker", start: () => GenServer.start(Worker) }
+            ]
+        })"#;
+        let body = main_body(source);
+        assert!(body.contains("strategy => one_for_all"), "should have one_for_all strategy");
+    }
+
+    #[test]
+    fn supervisor_needs_supervisor_flag() {
+        let allocator = Allocator::default();
+        let source_type = SourceType::from_path("test.ts").unwrap();
+        let source = r#"Supervisor.start({
+            strategy: "one_for_one",
+            children: [{ id: "w", start: () => GenServer.start(W) }]
+        })"#;
+        let parsed = Parser::new(&allocator, source, source_type).parse();
+        let result = compile("test", &parsed.program);
+        assert!(result.needs_supervisor, "should set needs_supervisor flag");
+    }
+
+    #[test]
+    fn no_supervisor_no_flag() {
+        let allocator = Allocator::default();
+        let source_type = SourceType::from_path("test.ts").unwrap();
+        let source = "console.log(\"hello\")";
+        let parsed = Parser::new(&allocator, source, source_type).parse();
+        let result = compile("test", &parsed.program);
+        assert!(!result.needs_supervisor, "should not set needs_supervisor flag");
     }
 }

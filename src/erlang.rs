@@ -221,6 +221,46 @@ pub fn gen_server_start_helper() -> String {
     .to_string()
 }
 
+pub fn gen_server_start_link_helper() -> String {
+    "juice_gen_server_start_link(Module) ->\n    \
+     gen_server:start_link(Module, [], [])."
+    .to_string()
+}
+
+pub fn erlang_error(reason: &str) -> String {
+    format!("erlang:error({{error, <<\"{reason}\">>}})")
+}
+
+pub fn erlang_error_expr(compiled_expr: &str) -> String {
+    format!("erlang:error({{error, {compiled_expr}}})")
+}
+
+pub fn supervisor_module() -> String {
+    "-module(juice_supervisor).\n\
+     -behaviour(supervisor).\n\
+     -export([start_link/2, init/1, find_child/2]).\n\
+     \n\
+     start_link(SupFlags, ChildSpecs) ->\n    \
+         supervisor:start_link(?MODULE, {SupFlags, ChildSpecs}).\n\
+     \n\
+     init({SupFlags, ChildSpecs}) ->\n    \
+         {ok, {SupFlags, ChildSpecs}}.\n\
+     \n\
+     find_child(SupPid, Id) ->\n    \
+         find_child(SupPid, Id, 10).\n\
+     \n\
+     find_child(_SupPid, _Id, 0) -> undefined;\n\
+     find_child(SupPid, Id, Retries) ->\n    \
+         Children = supervisor:which_children(SupPid),\n    \
+         case lists:keyfind(Id, 1, Children) of\n        \
+             {Id, Pid, _, _} when is_pid(Pid) -> Pid;\n        \
+             _ ->\n            \
+                 timer:sleep(10),\n            \
+                 find_child(SupPid, Id, Retries - 1)\n    \
+         end.\n"
+    .to_string()
+}
+
 fn escape_erlang_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
