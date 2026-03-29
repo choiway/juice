@@ -2,10 +2,34 @@ use oxc_ast::ast::*;
 
 use crate::erlang;
 
+struct GenServerDef<'a> {
+    init_body: &'a FunctionBody<'a>,
+    handle_call: Option<(&'a FormalParameters<'a>, &'a FunctionBody<'a>)>,
+    handle_cast: Option<(&'a FormalParameters<'a>, &'a FunctionBody<'a>)>,
+}
+
 pub fn compile(module_name: &str, program: &Program) -> String {
+    // Pass 1: detect GenServer definitions
+    let mut genserver: Option<GenServerDef> = None;
+    let mut genserver_stmt_index: Option<usize> = None;
+
+    for (i, stmt) in program.body.iter().enumerate() {
+        if let Statement::VariableDeclaration(decl) = stmt {
+            if let Some(gs) = detect_genserver(decl) {
+                genserver = Some(gs);
+                genserver_stmt_index = Some(i);
+                break;
+            }
+        }
+    }
+
+    // Pass 2: compile remaining statements into main/0
     let mut body_lines: Vec<String> = Vec::new();
 
-    for stmt in &program.body {
+    for (i, stmt) in program.body.iter().enumerate() {
+        if Some(i) == genserver_stmt_index {
+            continue;
+        }
         if let Some(line) = compile_statement(stmt) {
             body_lines.push(line);
         }
@@ -27,14 +51,45 @@ pub fn compile(module_name: &str, program: &Program) -> String {
     let mut output = String::new();
     output.push_str(&erlang::module_attribute(module_name));
     output.push('\n');
-    output.push_str(&erlang::export_attribute(&[("main", 0)]));
+
+    if genserver.is_some() {
+        output.push_str(&erlang::behaviour_attribute("gen_server"));
+        output.push('\n');
+        output.push_str(&erlang::export_attribute(&[
+            ("main", 0), ("init", 1), ("handle_call", 3), ("handle_cast", 2), ("handle_info", 2),
+        ]));
+    } else {
+        output.push_str(&erlang::export_attribute(&[("main", 0)]));
+    }
     output.push('\n');
     output.push('\n');
+
+    if let Some(ref gs) = genserver {
+        output.push_str(&compile_init_callback(gs));
+        output.push('\n');
+        output.push('\n');
+        output.push_str(&compile_handle_call_callback(gs));
+        output.push('\n');
+        output.push('\n');
+        output.push_str(&compile_handle_cast_callback(gs));
+        output.push('\n');
+        output.push('\n');
+        output.push_str(&erlang::default_handle_info());
+        output.push('\n');
+        output.push('\n');
+    }
+
     output.push_str(&erlang::function_def("main", &body));
     output.push('\n');
     output.push('\n');
     output.push_str(&erlang::to_string_helper());
     output.push('\n');
+
+    if genserver.is_some() {
+        output.push('\n');
+        output.push_str(&erlang::gen_server_start_helper());
+        output.push('\n');
+    }
 
     output
 }
@@ -45,6 +100,80 @@ pub fn compile_expr(expr: &Expression) -> Option<String> {
 
 pub fn compile_stmt(stmt: &Statement) -> Option<String> {
     compile_statement(stmt)
+}
+
+fn detect_genserver<'a>(decl: &'a VariableDeclaration<'a>) -> Option<GenServerDef<'a>> {
+    let declarator = decl.declarations.first()?;
+    let init_expr = declarator.init.as_ref()?;
+    let obj = match init_expr {
+        Expression::ObjectExpression(obj) => obj,
+        _ => return None,
+    };
+
+    let mut init_body: Option<&'a FunctionBody<'a>> = None;
+    let mut handle_call: Option<(&'a FormalParameters<'a>, &'a FunctionBody<'a>)> = None;
+    let mut handle_cast: Option<(&'a FormalParameters<'a>, &'a FunctionBody<'a>)> = None;
+
+    for prop in &obj.properties {
+        if let ObjectPropertyKind::ObjectProperty(p) = prop {
+            let key = match &p.key {
+                PropertyKey::StaticIdentifier(ident) => ident.name.as_str(),
+                _ => continue,
+            };
+            if let Expression::ArrowFunctionExpression(arrow) = &p.value {
+                match key {
+                    "init" => init_body = Some(&arrow.body),
+                    "handleCall" => handle_call = Some((&arrow.params, &arrow.body)),
+                    "handleCast" => handle_cast = Some((&arrow.params, &arrow.body)),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let init_body = init_body?;
+    Some(GenServerDef { init_body, handle_call, handle_cast })
+}
+
+fn compile_init_callback(gs: &GenServerDef) -> String {
+    let body = compile_function_body(gs.init_body)
+        .unwrap_or_else(|| "ok".to_string());
+    erlang::init_function(&body)
+}
+
+fn compile_handle_call_callback(gs: &GenServerDef) -> String {
+    match gs.handle_call {
+        Some((params, body)) => {
+            let msg_param = extract_param(params, 0, "Msg");
+            let state_param = extract_param(params, 1, "State");
+            let body_str = compile_function_body(body)
+                .unwrap_or_else(|| "ok".to_string());
+            erlang::handle_call_function(&msg_param, &state_param, &body_str)
+        }
+        None => "handle_call(_Msg, _From, State) ->\n    {reply, ok, State}.".to_string(),
+    }
+}
+
+fn compile_handle_cast_callback(gs: &GenServerDef) -> String {
+    match gs.handle_cast {
+        Some((params, body)) => {
+            let msg_param = extract_param(params, 0, "Msg");
+            let state_param = extract_param(params, 1, "State");
+            let body_str = compile_function_body(body)
+                .unwrap_or_else(|| "ok".to_string());
+            erlang::handle_cast_function(&msg_param, &state_param, &body_str)
+        }
+        None => erlang::default_handle_cast(),
+    }
+}
+
+fn extract_param(params: &FormalParameters, index: usize, default: &str) -> String {
+    params.items.get(index)
+        .and_then(|param| match &param.pattern {
+            BindingPattern::BindingIdentifier(ident) => Some(erlang::js_var_to_erlang(&ident.name)),
+            _ => None,
+        })
+        .unwrap_or_else(|| format!("_{default}"))
 }
 
 pub fn compile_stmt_repl(stmt: &Statement) -> Option<String> {
@@ -68,6 +197,7 @@ fn compile_statement(stmt: &Statement) -> Option<String> {
         Statement::VariableDeclaration(decl) => compile_var_declaration(decl),
         Statement::IfStatement(if_stmt) => compile_if_statement(if_stmt),
         Statement::ForStatement(for_stmt) => compile_for_statement(for_stmt),
+        Statement::ReturnStatement(ret) => compile_return_statement(ret),
         _ => None,
     }
 }
@@ -85,6 +215,13 @@ fn compile_var_declaration(decl: &VariableDeclaration) -> Option<String> {
         None
     } else {
         Some(bindings.join(",\n    "))
+    }
+}
+
+fn compile_return_statement(ret: &ReturnStatement) -> Option<String> {
+    match &ret.argument {
+        Some(expr) => compile_expression(expr),
+        None => Some("ok".to_string()),
     }
 }
 
@@ -351,6 +488,12 @@ fn compile_call(call: &CallExpression) -> Option<String> {
                 Some(erlang::io_format_expr(&expr))
             }
         }
+    } else if is_genserver_start(call) {
+        compile_genserver_start(call)
+    } else if is_genserver_call(call) {
+        compile_genserver_call(call)
+    } else if is_genserver_cast(call) {
+        compile_genserver_cast(call)
     } else if is_spawn(call) {
         compile_spawn(call)
     } else if is_receive(call) {
@@ -451,6 +594,55 @@ fn compile_spawn(call: &CallExpression) -> Option<String> {
     let expr = arg.as_expression()?;
     let compiled_fn = compile_expression(expr)?;
     Some(erlang::spawn_call(&compiled_fn))
+}
+
+fn is_genserver_start(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "GenServer" && member.property.name == "start";
+        }
+    }
+    false
+}
+
+fn compile_genserver_start(_call: &CallExpression) -> Option<String> {
+    Some("juice_gen_server_start(?MODULE)".to_string())
+}
+
+fn is_genserver_call(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "GenServer" && member.property.name == "call";
+        }
+    }
+    false
+}
+
+fn compile_genserver_call(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 2 {
+        return None;
+    }
+    let pid = compile_argument(&call.arguments[0])?;
+    let msg = compile_argument(&call.arguments[1])?;
+    Some(erlang::gen_server_call(&pid, &msg))
+}
+
+fn is_genserver_cast(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "GenServer" && member.property.name == "cast";
+        }
+    }
+    false
+}
+
+fn compile_genserver_cast(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 2 {
+        return None;
+    }
+    let pid = compile_argument(&call.arguments[0])?;
+    let msg = compile_argument(&call.arguments[1])?;
+    Some(erlang::gen_server_cast(&pid, &msg))
 }
 
 fn is_console_log(call: &CallExpression) -> bool {
@@ -1301,5 +1493,186 @@ mod tests {
     fn to_string_helper_has_map_clause() {
         let erl = compile_js("console.log(\"hi\")");
         assert!(erl.contains("is_map(V)"));
+    }
+
+    // === ReturnStatement ===
+
+    #[test]
+    fn return_expression() {
+        assert_eq!(
+            main_body("const f = (x) => { return x + 1 }"),
+            "F = fun(X) ->\n        (X + 1)\n    end"
+        );
+    }
+
+    #[test]
+    fn return_object() {
+        assert_eq!(
+            main_body("const f = () => { return { count: 0 } }"),
+            "F = fun() ->\n        #{count => 0}\n    end"
+        );
+    }
+
+    #[test]
+    fn return_bare() {
+        assert_eq!(
+            main_body("const f = () => { return }"),
+            "F = fun() ->\n        ok\n    end"
+        );
+    }
+
+    // === GenServer.call / GenServer.cast ===
+
+    #[test]
+    fn genserver_call_compiles() {
+        assert_eq!(
+            main_body("GenServer.call(pid, \"increment\")"),
+            "gen_server:call(Pid, increment)"
+        );
+    }
+
+    #[test]
+    fn genserver_cast_compiles() {
+        assert_eq!(
+            main_body("GenServer.cast(pid, \"update\")"),
+            "gen_server:cast(Pid, update)"
+        );
+    }
+
+    #[test]
+    fn genserver_call_in_console_log() {
+        assert_eq!(
+            main_body("console.log(GenServer.call(pid, \"get\"))"),
+            "io:format(\"~p~n\", [gen_server:call(Pid, get)])"
+        );
+    }
+
+    // === GenServer.start ===
+
+    #[test]
+    fn genserver_start_compiles() {
+        assert_eq!(
+            main_body("const pid = GenServer.start(Counter)"),
+            "Pid = juice_gen_server_start(?MODULE)"
+        );
+    }
+
+    // === GenServer module structure ===
+
+    fn genserver_source() -> &'static str {
+        "const Counter = {\n  init: () => ({ count: 0 }),\n  handleCall: (msg, state) => {\n    if (msg === \"increment\") {\n      const next = { count: state.count + 1 }\n      return { reply: next.count, state: next }\n    } else if (msg === \"get\") {\n      return { reply: state.count, state: state }\n    }\n  }\n}\nconst pid = GenServer.start(Counter)\nconsole.log(GenServer.call(pid, \"increment\"))"
+    }
+
+    #[test]
+    fn genserver_module_has_behaviour() {
+        let erl = compile_js(genserver_source());
+        assert!(erl.contains("-behaviour(gen_server)."), "missing behaviour: {erl}");
+    }
+
+    #[test]
+    fn genserver_module_exports_callbacks() {
+        let erl = compile_js(genserver_source());
+        assert!(erl.contains("init/1"), "missing init export: {erl}");
+        assert!(erl.contains("handle_call/3"), "missing handle_call export: {erl}");
+        assert!(erl.contains("handle_cast/2"), "missing handle_cast export: {erl}");
+        assert!(erl.contains("handle_info/2"), "missing handle_info export: {erl}");
+    }
+
+    #[test]
+    fn genserver_init_callback() {
+        let erl = compile_js(genserver_source());
+        assert!(erl.contains("init(_Args) ->\n    {ok, #{count => 0}}."), "missing init callback: {erl}");
+    }
+
+    #[test]
+    fn genserver_definition_skipped_in_main() {
+        let erl = compile_js(genserver_source());
+        // main/0 should NOT contain the Counter map definition
+        let main_start = erl.find("main() ->").expect("no main");
+        let main_section = &erl[main_start..];
+        assert!(!main_section.contains("Counter ="), "Counter definition should be skipped in main: {main_section}");
+    }
+
+    // === handle_call callback ===
+
+    #[test]
+    fn genserver_handle_call_callback() {
+        let erl = compile_js(genserver_source());
+        assert!(erl.contains("handle_call(Msg, _From, State) ->"), "missing handle_call signature: {erl}");
+        assert!(erl.contains("#{reply := __Reply, state := __NewState}"), "missing map pattern match: {erl}");
+        assert!(erl.contains("{reply, __Reply, __NewState}"), "missing reply tuple: {erl}");
+        assert!(erl.contains("{reply, {error, unhandled}, State}"), "missing fallback: {erl}");
+    }
+
+    #[test]
+    fn genserver_handle_call_body_compiles() {
+        let erl = compile_js(genserver_source());
+        // The if/else-if chain should produce nested case expressions
+        assert!(erl.contains("Msg =:= increment"), "missing increment case: {erl}");
+        assert!(erl.contains("Msg =:= get"), "missing get case: {erl}");
+    }
+
+    // === handle_cast callback ===
+
+    #[test]
+    fn genserver_default_handle_cast() {
+        // genserver_source() has no handleCast → should get default
+        let erl = compile_js(genserver_source());
+        assert!(erl.contains("handle_cast(_Msg, State) ->\n    {noreply, State}."), "missing default handle_cast: {erl}");
+    }
+
+    #[test]
+    fn genserver_custom_handle_cast() {
+        let src = "const Counter = {\n  init: () => ({ count: 0 }),\n  handleCast: (msg, state) => {\n    if (msg === \"reset\") {\n      return { state: { count: 0 } }\n    }\n  }\n}\nconsole.log(\"hi\")";
+        let erl = compile_js(src);
+        assert!(erl.contains("handle_cast(Msg, State) ->"), "missing handle_cast signature: {erl}");
+        assert!(erl.contains("#{state := __NewState}"), "missing map pattern match: {erl}");
+        assert!(erl.contains("{noreply, __NewState}"), "missing noreply tuple: {erl}");
+        assert!(erl.contains("{noreply, State}"), "missing fallback: {erl}");
+    }
+
+    // === handle_info default ===
+
+    #[test]
+    fn genserver_default_handle_info() {
+        let erl = compile_js(genserver_source());
+        assert!(erl.contains("handle_info(_Info, State) ->\n    {noreply, State}."), "missing default handle_info: {erl}");
+    }
+
+    // === GenServer start helper + integration ===
+
+    #[test]
+    fn genserver_start_helper_present() {
+        let erl = compile_js(genserver_source());
+        assert!(erl.contains("juice_gen_server_start(Module) ->"), "missing start helper: {erl}");
+        assert!(erl.contains("gen_server:start_link(Module, [], [])"), "missing start_link: {erl}");
+    }
+
+    #[test]
+    fn genserver_milestone_demo() {
+        let src = "const Counter = {\n  init: () => ({ count: 0 }),\n  handleCall: (msg, state) => {\n    if (msg === \"increment\") {\n      const next = { count: state.count + 1 }\n      return { reply: next.count, state: next }\n    } else if (msg === \"get\") {\n      return { reply: state.count, state: state }\n    }\n  }\n}\nconst pid = GenServer.start(Counter)\nconsole.log(GenServer.call(pid, \"increment\"))\nconsole.log(GenServer.call(pid, \"increment\"))\nconsole.log(GenServer.call(pid, \"get\"))";
+        let erl = compile_js(src);
+        // Module structure
+        assert!(erl.contains("-behaviour(gen_server)."), "missing behaviour");
+        assert!(erl.contains("init/1"), "missing init export");
+        assert!(erl.contains("handle_call/3"), "missing handle_call export");
+        // Callbacks
+        assert!(erl.contains("init(_Args) ->"), "missing init");
+        assert!(erl.contains("handle_call(Msg, _From, State) ->"), "missing handle_call");
+        assert!(erl.contains("handle_cast(_Msg, State) ->"), "missing default handle_cast");
+        // main/0
+        assert!(erl.contains("juice_gen_server_start(?MODULE)"), "missing start in main");
+        assert!(erl.contains("gen_server:call(Pid, increment)"), "missing call in main");
+        assert!(erl.contains("gen_server:call(Pid, get)"), "missing get call in main");
+        // Helper
+        assert!(erl.contains("juice_gen_server_start(Module) ->"), "missing start helper");
+    }
+
+    #[test]
+    fn non_genserver_module_no_behaviour() {
+        let erl = compile_js("console.log(\"hello\")");
+        assert!(!erl.contains("-behaviour"), "non-genserver should have no behaviour");
+        assert!(!erl.contains("init/1"), "non-genserver should have no init export");
+        assert!(!erl.contains("juice_gen_server_start"), "non-genserver should have no start helper");
     }
 }

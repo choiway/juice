@@ -2,6 +2,10 @@ pub fn module_attribute(name: &str) -> String {
     format!("-module({name}).")
 }
 
+pub fn behaviour_attribute(name: &str) -> String {
+    format!("-behaviour({name}).")
+}
+
 pub fn export_attribute(funs: &[(&str, usize)]) -> String {
     let exports: Vec<String> = funs.iter().map(|(name, arity)| format!("{name}/{arity}")).collect();
     format!("-export([{}]).", exports.join(", "))
@@ -162,6 +166,59 @@ pub fn map_literal(entries: &[(String, String)]) -> String {
 
 pub fn maps_get(key: &str, map: &str) -> String {
     format!("maps:get({}, {map})", atom_key(key))
+}
+
+pub fn init_function(body: &str) -> String {
+    format!("init(_Args) ->\n    {{ok, {body}}}.")
+}
+
+pub fn handle_call_function(msg_param: &str, state_param: &str, body: &str) -> String {
+    format!(
+        "handle_call({msg_param}, _From, {state_param}) ->\n    \
+         __Result = {body},\n    \
+         case __Result of\n        \
+         #{{reply := __Reply, state := __NewState}} ->\n            \
+         {{reply, __Reply, __NewState}};\n        \
+         _ ->\n            \
+         {{reply, {{error, unhandled}}, {state_param}}}\n    \
+         end."
+    )
+}
+
+pub fn handle_cast_function(msg_param: &str, state_param: &str, body: &str) -> String {
+    format!(
+        "handle_cast({msg_param}, {state_param}) ->\n    \
+         __Result = {body},\n    \
+         case __Result of\n        \
+         #{{state := __NewState}} ->\n            \
+         {{noreply, __NewState}};\n        \
+         _ ->\n            \
+         {{noreply, {state_param}}}\n    \
+         end."
+    )
+}
+
+pub fn default_handle_cast() -> String {
+    "handle_cast(_Msg, State) ->\n    {noreply, State}.".to_string()
+}
+
+pub fn default_handle_info() -> String {
+    "handle_info(_Info, State) ->\n    {noreply, State}.".to_string()
+}
+
+pub fn gen_server_call(pid: &str, msg: &str) -> String {
+    format!("gen_server:call({pid}, {msg})")
+}
+
+pub fn gen_server_cast(pid: &str, msg: &str) -> String {
+    format!("gen_server:cast({pid}, {msg})")
+}
+
+pub fn gen_server_start_helper() -> String {
+    "juice_gen_server_start(Module) ->\n    \
+     {ok, Pid} = gen_server:start_link(Module, [], []),\n    \
+     Pid."
+    .to_string()
 }
 
 fn escape_erlang_string(s: &str) -> String {
