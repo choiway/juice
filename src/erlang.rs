@@ -261,6 +261,118 @@ pub fn supervisor_module() -> String {
     .to_string()
 }
 
+pub fn gen_server_start_named_helper() -> String {
+    "juice_gen_server_start_named(Module, Name) ->\n    \
+     {ok, Pid} = gen_server:start_link({local, Name}, Module, [], []),\n    \
+     Pid."
+    .to_string()
+}
+
+pub fn gen_server_start_link_named_helper() -> String {
+    "juice_gen_server_start_link_named(Module, Name) ->\n    \
+     gen_server:start_link({local, Name}, Module, [], [])."
+    .to_string()
+}
+
+pub fn shell_module() -> String {
+    "-module(juice_shell).\n\
+     -export([start/1]).\n\
+     \n\
+     start([UserModule]) ->\n    \
+         process_flag(trap_exit, true),\n    \
+         UserModule:main(),\n    \
+         loop(erl_eval:new_bindings()).\n\
+     \n\
+     loop(Bindings) ->\n    \
+         case io:get_line(\"\") of\n        \
+             eof -> ok;\n        \
+             {error, _} -> ok;\n        \
+             Line ->\n            \
+                 Trimmed = string:strip(string:strip(Line, right, $\\n), right, $\\r),\n            \
+                 case Trimmed of\n                \
+                     [] ->\n                    \
+                         io:format(\"\\0JUICE_RESULT\\0ok\\0JUICE_END\\0~n\"),\n                    \
+                         loop(Bindings);\n                \
+                     Expr ->\n                    \
+                         case catch eval(Expr, Bindings) of\n                        \
+                             {ok, Value, NewBindings} ->\n                            \
+                                 Fmt = lists:flatten(io_lib:format(\"~p\", [Value])),\n                            \
+                                 io:format(\"\\0JUICE_RESULT\\0~s\\0JUICE_END\\0~n\", [Fmt]),\n                            \
+                                 loop(NewBindings);\n                        \
+                             {error, Reason} ->\n                            \
+                                 Err = lists:flatten(io_lib:format(\"~p\", [Reason])),\n                            \
+                                 io:format(\"\\0JUICE_ERROR\\0~s\\0JUICE_END\\0~n\", [Err]),\n                            \
+                                 loop(Bindings);\n                        \
+                             Other ->\n                            \
+                                 Err = lists:flatten(io_lib:format(\"~p\", [Other])),\n                            \
+                                 io:format(\"\\0JUICE_ERROR\\0~s\\0JUICE_END\\0~n\", [Err]),\n                            \
+                                 loop(Bindings)\n                    \
+                         end\n                \
+                 end\n        \
+         end.\n\
+     \n\
+     eval(ExprStr, Bindings) ->\n    \
+         {ok, Tokens, _} = erl_scan:string(ExprStr ++ \".\"),\n    \
+         {ok, Exprs} = erl_parse:parse_exprs(Tokens),\n    \
+         {value, Value, NewBindings} = erl_eval:exprs(Exprs, Bindings),\n    \
+         {ok, Value, NewBindings}.\n"
+    .to_string()
+}
+
+pub fn remote_shell_module() -> String {
+    "-module(juice_remote_shell).\n\
+     -export([start/1]).\n\
+     \n\
+     start([TargetNode]) ->\n    \
+         case net_adm:ping(TargetNode) of\n        \
+             pong ->\n            \
+                 io:format(\"\\0JUICE_RESULT\\0connected\\0JUICE_END\\0~n\"),\n            \
+                 loop(TargetNode, erl_eval:new_bindings());\n        \
+             pang ->\n            \
+                 io:format(\"\\0JUICE_ERROR\\0cannot connect to ~s\\0JUICE_END\\0~n\", [TargetNode]),\n            \
+                 halt(1)\n    \
+         end.\n\
+     \n\
+     loop(TargetNode, Bindings) ->\n    \
+         case io:get_line(\"\") of\n        \
+             eof -> ok;\n        \
+             {error, _} -> ok;\n        \
+             Line ->\n            \
+                 Trimmed = string:strip(string:strip(Line, right, $\\n), right, $\\r),\n            \
+                 case Trimmed of\n                \
+                     [] ->\n                    \
+                         io:format(\"\\0JUICE_RESULT\\0ok\\0JUICE_END\\0~n\"),\n                    \
+                         loop(TargetNode, Bindings);\n                \
+                     Expr ->\n                    \
+                         case catch eval_remote(TargetNode, Expr, Bindings) of\n                        \
+                             {ok, Value, NewBindings} ->\n                            \
+                                 Fmt = lists:flatten(io_lib:format(\"~p\", [Value])),\n                            \
+                                 io:format(\"\\0JUICE_RESULT\\0~s\\0JUICE_END\\0~n\", [Fmt]),\n                            \
+                                 loop(TargetNode, NewBindings);\n                        \
+                             {error, Reason} ->\n                            \
+                                 Err = lists:flatten(io_lib:format(\"~p\", [Reason])),\n                            \
+                                 io:format(\"\\0JUICE_ERROR\\0~s\\0JUICE_END\\0~n\", [Err]),\n                            \
+                                 loop(TargetNode, Bindings);\n                        \
+                             Other ->\n                            \
+                                 Err = lists:flatten(io_lib:format(\"~p\", [Other])),\n                            \
+                                 io:format(\"\\0JUICE_ERROR\\0~s\\0JUICE_END\\0~n\", [Err]),\n                            \
+                                 loop(TargetNode, Bindings)\n                    \
+                         end\n                \
+                 end\n        \
+         end.\n\
+     \n\
+     eval_remote(TargetNode, ExprStr, Bindings) ->\n    \
+         {ok, Tokens, _} = erl_scan:string(ExprStr ++ \".\"),\n    \
+         {ok, Exprs} = erl_parse:parse_exprs(Tokens),\n    \
+         case rpc:call(TargetNode, erl_eval, exprs, [Exprs, Bindings]) of\n        \
+             {value, Value, NewBindings} ->\n            \
+                 {ok, Value, NewBindings};\n        \
+             {badrpc, Reason} ->\n            \
+                 {error, Reason}\n    \
+         end.\n"
+    .to_string()
+}
+
 fn escape_erlang_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }

@@ -49,6 +49,7 @@ pub fn compile(module_name: &str, program: &Program) -> CompileResult {
     }
 
     let uses_spawn = body_lines.iter().any(|line| line.contains("erlang:spawn("));
+    let uses_named_genserver = body_lines.iter().any(|line| line.contains("start_named(") || line.contains("start_link_named"));
 
     let body = if body_lines.is_empty() {
         "ok".to_string()
@@ -73,6 +74,9 @@ pub fn compile(module_name: &str, program: &Program) -> CompileResult {
         ];
         if needs_supervisor {
             exports.push(("juice_gen_server_start_link", 1));
+        }
+        if uses_named_genserver {
+            exports.push(("juice_gen_server_start_link_named", 2));
         }
         output.push_str(&erlang::export_attribute(&exports));
     } else {
@@ -109,6 +113,14 @@ pub fn compile(module_name: &str, program: &Program) -> CompileResult {
         if needs_supervisor {
             output.push('\n');
             output.push_str(&erlang::gen_server_start_link_helper());
+            output.push('\n');
+        }
+        if uses_named_genserver {
+            output.push('\n');
+            output.push_str(&erlang::gen_server_start_named_helper());
+            output.push('\n');
+            output.push('\n');
+            output.push_str(&erlang::gen_server_start_link_named_helper());
             output.push('\n');
         }
     }
@@ -239,6 +251,12 @@ pub fn compile_stmt_repl(stmt: &Statement) -> Option<String> {
         }
         _ => compile_statement(stmt),
     }
+}
+
+pub fn compile_stmt_persistent_repl(stmt: &Statement) -> Option<String> {
+    // Like compile_stmt_repl but bare expressions are NOT wrapped in io:format —
+    // the eval server handles display via the protocol.
+    compile_statement(stmt)
 }
 
 /// Compile a statement in main/0 context, with optional catch wrapping for
@@ -592,6 +610,16 @@ fn compile_call(call: &CallExpression) -> Option<String> {
         compile_supervisor_which_children(call)
     } else if is_process_exit(call) {
         compile_process_exit(call)
+    } else if is_process_register(call) {
+        compile_process_register(call)
+    } else if is_process_whereis(call) {
+        compile_process_whereis(call)
+    } else if is_node_connect(call) {
+        compile_node_connect(call)
+    } else if is_node_self(call) {
+        compile_node_self(call)
+    } else if is_node_list(call) {
+        compile_node_list(call)
     } else if is_spawn(call) {
         compile_spawn(call)
     } else if is_receive(call) {
@@ -703,8 +731,32 @@ fn is_genserver_start(call: &CallExpression) -> bool {
     false
 }
 
-fn compile_genserver_start(_call: &CallExpression) -> Option<String> {
+fn compile_genserver_start(call: &CallExpression) -> Option<String> {
+    // Check for optional second argument: { name: "counter" }
+    if call.arguments.len() >= 2 {
+        if let Some(name) = extract_genserver_name(&call.arguments[1]) {
+            return Some(format!("juice_gen_server_start_named(?MODULE, {name})"));
+        }
+    }
     Some("juice_gen_server_start(?MODULE)".to_string())
+}
+
+fn extract_genserver_name(arg: &Argument) -> Option<String> {
+    let expr = arg.as_expression()?;
+    if let Expression::ObjectExpression(obj) = expr {
+        for prop in &obj.properties {
+            if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                if let PropertyKey::StaticIdentifier(ident) = &p.key {
+                    if ident.name == "name" {
+                        if let Expression::StringLiteral(s) = &p.value {
+                            return Some(erlang::atom_literal(&s.value));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_genserver_call(call: &CallExpression) -> bool {
@@ -816,6 +868,7 @@ fn compile_child_spec(expr: &Expression) -> Option<String> {
     };
 
     let mut id = None;
+    let mut genserver_name = None;
 
     for prop in &obj.properties {
         if let ObjectPropertyKind::ObjectProperty(p) = prop {
@@ -823,10 +876,17 @@ fn compile_child_spec(expr: &Expression) -> Option<String> {
                 PropertyKey::StaticIdentifier(ident) => ident.name.as_str(),
                 _ => continue,
             };
-            if key == "id" {
-                if let Expression::StringLiteral(s) = &p.value {
-                    id = Some(s.value.to_string());
+            match key {
+                "id" => {
+                    if let Expression::StringLiteral(s) = &p.value {
+                        id = Some(s.value.to_string());
+                    }
                 }
+                "start" => {
+                    // Extract name from: () => GenServer.start(Counter, { name: "x" })
+                    genserver_name = extract_child_start_name(&p.value);
+                }
+                _ => {}
             }
         }
     }
@@ -838,9 +898,41 @@ fn compile_child_spec(expr: &Expression) -> Option<String> {
         erlang::string_literal(&id_str)
     };
 
+    let start_mfa = if let Some(name) = genserver_name {
+        format!("{{?MODULE, juice_gen_server_start_link_named, [?MODULE, {name}]}}")
+    } else {
+        "{?MODULE, juice_gen_server_start_link, [?MODULE]}".to_string()
+    };
+
     Some(format!(
-        "#{{id => {id_erl}, start => {{?MODULE, juice_gen_server_start_link, [?MODULE]}}, restart => permanent, type => worker}}"
+        "#{{id => {id_erl}, start => {start_mfa}, restart => permanent, type => worker}}"
     ))
+}
+
+/// Extract the GenServer name from a child spec's start arrow function.
+/// Matches: () => GenServer.start(Counter, { name: "x" })
+fn extract_child_start_name(expr: &Expression) -> Option<String> {
+    if let Expression::ArrowFunctionExpression(arrow) = expr {
+        // Look at the body — it should be an expression body or single-statement body
+        // containing a GenServer.start call with a name option
+        for stmt in &arrow.body.statements {
+            if let Statement::ExpressionStatement(expr_stmt) = stmt {
+                if let Expression::CallExpression(call) = &expr_stmt.expression {
+                    if is_genserver_start(call) && call.arguments.len() >= 2 {
+                        return extract_genserver_name(&call.arguments[1]);
+                    }
+                }
+            }
+            if let Statement::ReturnStatement(ret) = stmt {
+                if let Some(Expression::CallExpression(call)) = &ret.argument {
+                    if is_genserver_start(call) && call.arguments.len() >= 2 {
+                        return extract_genserver_name(&call.arguments[1]);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_supervisor_find_child(call: &CallExpression) -> bool {
@@ -894,6 +986,88 @@ fn compile_process_exit(call: &CallExpression) -> Option<String> {
     let pid = compile_argument(&call.arguments[0])?;
     let reason = compile_argument(&call.arguments[1])?;
     Some(format!("erlang:exit({pid}, {reason})"))
+}
+
+fn is_process_register(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "Process" && member.property.name == "register";
+        }
+    }
+    false
+}
+
+fn compile_process_register(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 2 {
+        return None;
+    }
+    let name = compile_argument(&call.arguments[0])?;
+    let pid = compile_argument(&call.arguments[1])?;
+    Some(format!("erlang:register({name}, {pid})"))
+}
+
+fn is_process_whereis(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "Process" && member.property.name == "whereis";
+        }
+    }
+    false
+}
+
+fn compile_process_whereis(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 1 {
+        return None;
+    }
+    let name = compile_argument(&call.arguments[0])?;
+    Some(format!("erlang:whereis({name})"))
+}
+
+fn is_node_connect(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "Node" && member.property.name == "connect";
+        }
+    }
+    false
+}
+
+fn compile_node_connect(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 1 {
+        return None;
+    }
+    // Node names always need to be quoted atoms (contain @)
+    if let Some(Argument::StringLiteral(s)) = call.arguments.first() {
+        return Some(format!("net_adm:ping('{}')", s.value));
+    }
+    let node = compile_argument(&call.arguments[0])?;
+    Some(format!("net_adm:ping({node})"))
+}
+
+fn is_node_self(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "Node" && member.property.name == "self";
+        }
+    }
+    false
+}
+
+fn compile_node_self(_call: &CallExpression) -> Option<String> {
+    Some("node()".to_string())
+}
+
+fn is_node_list(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "Node" && member.property.name == "list";
+        }
+    }
+    false
+}
+
+fn compile_node_list(_call: &CallExpression) -> Option<String> {
+    Some("nodes()".to_string())
 }
 
 fn is_console_log(call: &CallExpression) -> bool {
@@ -2066,5 +2240,81 @@ mod tests {
         let parsed = Parser::new(&allocator, source, source_type).parse();
         let result = compile("test", &parsed.program);
         assert!(!result.needs_supervisor, "should not set needs_supervisor flag");
+    }
+
+    // === Named GenServer ===
+
+    #[test]
+    fn genserver_start_named() {
+        assert_eq!(
+            main_body("GenServer.start(Counter, { name: \"counter\" })"),
+            "juice_gen_server_start_named(?MODULE, counter)"
+        );
+    }
+
+    #[test]
+    fn genserver_start_unnamed_unchanged() {
+        assert_eq!(
+            main_body("GenServer.start(Counter)"),
+            "juice_gen_server_start(?MODULE)"
+        );
+    }
+
+    // === Process builtins ===
+
+    #[test]
+    fn process_register() {
+        assert_eq!(
+            main_body("Process.register(\"counter\", pid)"),
+            "erlang:register(counter, Pid)"
+        );
+    }
+
+    #[test]
+    fn process_whereis() {
+        assert_eq!(
+            main_body("Process.whereis(\"counter\")"),
+            "erlang:whereis(counter)"
+        );
+    }
+
+    // === Node builtins ===
+
+    #[test]
+    fn node_self() {
+        assert_eq!(
+            main_body("console.log(Node.self())"),
+            "io:format(\"~p~n\", [node()])"
+        );
+    }
+
+    #[test]
+    fn node_connect() {
+        assert_eq!(
+            main_body("Node.connect(\"node1@localhost\")"),
+            "net_adm:ping('node1@localhost')"
+        );
+    }
+
+    #[test]
+    fn node_list() {
+        assert_eq!(
+            main_body("console.log(Node.list())"),
+            "io:format(\"~p~n\", [nodes()])"
+        );
+    }
+
+    // === Named GenServer in supervision ===
+
+    #[test]
+    fn named_child_spec_uses_named_start_link() {
+        let source = r#"Supervisor.start({
+            strategy: "one_for_one",
+            children: [
+                { id: "counter", start: () => GenServer.start(Counter, { name: "counter" }) }
+            ]
+        })"#;
+        let body = main_body(source);
+        assert!(body.contains("start_link_named, [?MODULE, counter]"), "should use named start_link: {body}");
     }
 }

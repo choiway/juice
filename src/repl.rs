@@ -1,5 +1,5 @@
-use std::io::{self, Write};
-use std::process::Command;
+use std::io::{self, BufRead, Write};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
@@ -177,5 +177,338 @@ pub fn run() {
         stdout.flush().unwrap();
     }
 
+    println!("Goodbye!");
+}
+
+enum ShellMessage {
+    Result(String),
+    Error(String),
+}
+
+/// Parse stdout from the Erlang eval server, extracting delimited results.
+/// Non-delimited output (io:format from user code) is printed directly.
+fn start_reader_thread(
+    stdout: std::process::ChildStdout,
+    tx: mpsc::Sender<ShellMessage>,
+) {
+    thread::spawn(move || {
+        let reader = io::BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if let Some(rest) = line.strip_prefix("\0JUICE_RESULT\0") {
+                if let Some(value) = rest.strip_suffix("\0JUICE_END\0") {
+                    let _ = tx.send(ShellMessage::Result(value.to_string()));
+                    continue;
+                }
+            }
+            if let Some(rest) = line.strip_prefix("\0JUICE_ERROR\0") {
+                if let Some(value) = rest.strip_suffix("\0JUICE_END\0") {
+                    let _ = tx.send(ShellMessage::Error(value.to_string()));
+                    continue;
+                }
+            }
+            // Pass-through: io:format output from user code / OTP reports
+            println!("{line}");
+        }
+    });
+}
+
+/// Run a persistent REPL connected to a long-running Erlang VM.
+/// The VM starts the user's supervision tree, then accepts eval requests.
+pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
+    let prompt = match node_name {
+        Some(name) => format!("juice@{name}> "),
+        None => "juice> ".to_string(),
+    };
+
+    let mut cmd = Command::new("erl");
+    cmd.arg("-noshell")
+        .arg("-pa").arg(".")
+        .arg("-s").arg("juice_shell").arg("start").arg(module_name)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    if let Some(name) = node_name {
+        cmd.arg("-sname").arg(name);
+        cmd.arg("-setcookie").arg("juice");
+    }
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("Error starting Erlang VM: {e}");
+        std::process::exit(1);
+    });
+
+    let child_stdin = child.stdin.take().expect("Failed to open stdin");
+    let child_stdout = child.stdout.take().expect("Failed to open stdout");
+
+    // Result channel from reader thread
+    let (result_tx, result_rx) = mpsc::channel::<ShellMessage>();
+    start_reader_thread(child_stdout, result_tx);
+
+    // User input channel
+    let (input_tx, input_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) => {
+                    if input_tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Wait for main/0 to complete (starts supervision tree synchronously)
+    // Give a brief moment for the shell to enter its eval loop
+    thread::sleep(std::time::Duration::from_millis(300));
+
+    let mut stdout = io::stdout();
+    let mut erl_stdin = child_stdin;
+    let mut buffer = String::new();
+
+    print!("{prompt}");
+    stdout.flush().unwrap();
+
+    while let Ok(line) = input_rx.recv() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() && buffer.is_empty() {
+            print!("{prompt}");
+            stdout.flush().unwrap();
+            continue;
+        }
+
+        if buffer.is_empty() {
+            buffer = trimmed.to_string();
+        } else {
+            buffer.push('\n');
+            buffer.push_str(trimmed);
+        }
+
+        // Parse JS
+        let allocator = Allocator::default();
+        let source_type = SourceType::from_path("repl.ts").unwrap();
+        let parser_return = Parser::new(&allocator, &buffer, source_type).parse();
+
+        if !parser_return.errors.is_empty() {
+            if buffer.matches('{').count() > buffer.matches('}').count()
+                || buffer.matches('(').count() > buffer.matches(')').count()
+            {
+                print!("...> ");
+                stdout.flush().unwrap();
+                continue;
+            }
+            eprintln!("Parse error: {}", parser_return.errors[0]);
+            buffer.clear();
+            print!("{prompt}");
+            stdout.flush().unwrap();
+            continue;
+        }
+
+        // Compile JS → Erlang expressions
+        let mut exprs: Vec<String> = Vec::new();
+        for stmt in &parser_return.program.body {
+            if let Some(erl) = compiler::compile_stmt_persistent_repl(stmt) {
+                exprs.push(erl);
+            } else {
+                eprintln!("Unsupported statement");
+            }
+        }
+        buffer.clear();
+
+        if exprs.is_empty() {
+            print!("{prompt}");
+            stdout.flush().unwrap();
+            continue;
+        }
+
+        // Send compiled Erlang to the eval server (comma-separated, one line)
+        let eval_str = exprs.join(", ");
+        use io::Write as _;
+        if writeln!(erl_stdin, "{eval_str}").is_err() {
+            eprintln!("VM process exited");
+            break;
+        }
+        if erl_stdin.flush().is_err() {
+            eprintln!("VM process exited");
+            break;
+        }
+
+        // Wait for result
+        match result_rx.recv() {
+            Ok(ShellMessage::Result(value)) => {
+                println!("\x1b[36m{value}\x1b[0m");
+            }
+            Ok(ShellMessage::Error(err)) => {
+                eprintln!("\x1b[31mError: {err}\x1b[0m");
+            }
+            Err(_) => {
+                eprintln!("VM process exited");
+                break;
+            }
+        }
+
+        print!("{prompt}");
+        stdout.flush().unwrap();
+    }
+
+    let _ = child.wait();
+    println!("Goodbye!");
+}
+
+/// Run a REPL connected to a remote Erlang node.
+pub fn run_connect(target_node: &str) {
+    let prompt = format!("juice@{}> ", target_node.split('@').next().unwrap_or(target_node));
+
+    // Generate a unique client node name
+    let client_name = format!("juice_client_{}", std::process::id());
+
+    let mut cmd = Command::new("erl");
+    cmd.arg("-noshell")
+        .arg("-hidden")
+        .arg("-pa").arg(".")
+        .arg("-sname").arg(&client_name)
+        .arg("-setcookie").arg("juice")
+        .arg("-s").arg("juice_remote_shell").arg("start").arg(target_node)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("Error starting Erlang VM: {e}");
+        std::process::exit(1);
+    });
+
+    let child_stdin = child.stdin.take().expect("Failed to open stdin");
+    let child_stdout = child.stdout.take().expect("Failed to open stdout");
+
+    let (result_tx, result_rx) = mpsc::channel::<ShellMessage>();
+    start_reader_thread(child_stdout, result_tx);
+
+    // Wait for connection result
+    match result_rx.recv() {
+        Ok(ShellMessage::Result(msg)) => {
+            println!("Connected to {target_node}");
+            let _ = msg; // "connected"
+        }
+        Ok(ShellMessage::Error(err)) => {
+            eprintln!("Failed to connect: {err}");
+            let _ = child.wait();
+            std::process::exit(1);
+        }
+        Err(_) => {
+            eprintln!("Failed to start client node");
+            let _ = child.wait();
+            std::process::exit(1);
+        }
+    }
+
+    let (input_tx, input_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) => {
+                    if input_tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut stdout = io::stdout();
+    let mut erl_stdin = child_stdin;
+    let mut buffer = String::new();
+
+    print!("{prompt}");
+    stdout.flush().unwrap();
+
+    while let Ok(line) = input_rx.recv() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() && buffer.is_empty() {
+            print!("{prompt}");
+            stdout.flush().unwrap();
+            continue;
+        }
+
+        if buffer.is_empty() {
+            buffer = trimmed.to_string();
+        } else {
+            buffer.push('\n');
+            buffer.push_str(trimmed);
+        }
+
+        let allocator = Allocator::default();
+        let source_type = SourceType::from_path("repl.ts").unwrap();
+        let parser_return = Parser::new(&allocator, &buffer, source_type).parse();
+
+        if !parser_return.errors.is_empty() {
+            if buffer.matches('{').count() > buffer.matches('}').count()
+                || buffer.matches('(').count() > buffer.matches(')').count()
+            {
+                print!("...> ");
+                stdout.flush().unwrap();
+                continue;
+            }
+            eprintln!("Parse error: {}", parser_return.errors[0]);
+            buffer.clear();
+            print!("{prompt}");
+            stdout.flush().unwrap();
+            continue;
+        }
+
+        let mut exprs: Vec<String> = Vec::new();
+        for stmt in &parser_return.program.body {
+            if let Some(erl) = compiler::compile_stmt_persistent_repl(stmt) {
+                exprs.push(erl);
+            } else {
+                eprintln!("Unsupported statement");
+            }
+        }
+        buffer.clear();
+
+        if exprs.is_empty() {
+            print!("{prompt}");
+            stdout.flush().unwrap();
+            continue;
+        }
+
+        let eval_str = exprs.join(", ");
+        use io::Write as _;
+        if writeln!(erl_stdin, "{eval_str}").is_err() {
+            eprintln!("VM process exited");
+            break;
+        }
+        if erl_stdin.flush().is_err() {
+            eprintln!("VM process exited");
+            break;
+        }
+
+        match result_rx.recv() {
+            Ok(ShellMessage::Result(value)) => {
+                println!("\x1b[36m{value}\x1b[0m");
+            }
+            Ok(ShellMessage::Error(err)) => {
+                eprintln!("\x1b[31mError: {err}\x1b[0m");
+            }
+            Err(_) => {
+                eprintln!("VM process exited");
+                break;
+            }
+        }
+
+        print!("{prompt}");
+        stdout.flush().unwrap();
+    }
+
+    let _ = child.wait();
     println!("Goodbye!");
 }
