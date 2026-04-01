@@ -280,39 +280,69 @@ pub fn gen_server_start_link_named_helper() -> String {
 
 pub fn shell_module() -> String {
     "-module(juice_shell).\n\
-     -export([start/1]).\n\
+     -export([start/1, remote_eval/1]).\n\
      \n\
      start([UserModule]) ->\n    \
          process_flag(trap_exit, true),\n    \
-         UserModule:main(),\n\
+         UserModule:main(),\n    \
+         register(juice_shell, self()),\n    \
+         Shell = self(),\n    \
+         spawn_link(fun() -> stdin_reader(Shell) end),\n    \
          loop(erl_eval:new_bindings()).\n\
      \n\
-     loop(Bindings) ->\n    \
+     stdin_reader(Shell) ->\n    \
          case io:get_line(\"\") of\n        \
-             eof -> ok;\n        \
-             {error, _} -> ok;\n        \
+             eof -> Shell ! {stdin_eof};\n        \
+             {error, _} -> Shell ! {stdin_eof};\n        \
              Line ->\n            \
                  Trimmed = string:strip(string:strip(Line, right, $\\n), right, $\\r),\n            \
-                 case Trimmed of\n                \
-                     [] ->\n                    \
-                         io:format(\"\\0JUICE_RESULT\\0ok\\0JUICE_END\\0~n\"),\n                    \
+                 Shell ! {stdin_line, Trimmed},\n            \
+                 stdin_reader(Shell)\n    \
+         end.\n\
+     \n\
+     loop(Bindings) ->\n    \
+         receive\n        \
+             {stdin_eof} ->\n            \
+                 ok;\n        \
+             {stdin_line, []} ->\n            \
+                 io:format(\"\\0JUICE_RESULT\\0ok\\0JUICE_END\\0~n\"),\n            \
+                 loop(Bindings);\n        \
+             {stdin_line, Expr} ->\n            \
+                 case catch eval(Expr, Bindings) of\n                \
+                     {ok, Value, NewBindings} ->\n                    \
+                         Fmt = lists:flatten(io_lib:format(\"~p\", [Value])),\n                    \
+                         io:format(\"\\0JUICE_RESULT\\0~s\\0JUICE_END\\0~n\", [Fmt]),\n                    \
+                         loop(NewBindings);\n                \
+                     {error, Reason} ->\n                    \
+                         Err = lists:flatten(io_lib:format(\"~p\", [Reason])),\n                    \
+                         io:format(\"\\0JUICE_ERROR\\0~s\\0JUICE_END\\0~n\", [Err]),\n                    \
                          loop(Bindings);\n                \
-                     Expr ->\n                    \
-                         case catch eval(Expr, Bindings) of\n                        \
-                             {ok, Value, NewBindings} ->\n                            \
-                                 Fmt = lists:flatten(io_lib:format(\"~p\", [Value])),\n                            \
-                                 io:format(\"\\0JUICE_RESULT\\0~s\\0JUICE_END\\0~n\", [Fmt]),\n                            \
-                                 loop(NewBindings);\n                        \
-                             {error, Reason} ->\n                            \
-                                 Err = lists:flatten(io_lib:format(\"~p\", [Reason])),\n                            \
-                                 io:format(\"\\0JUICE_ERROR\\0~s\\0JUICE_END\\0~n\", [Err]),\n                            \
-                                 loop(Bindings);\n                        \
-                             Other ->\n                            \
-                                 Err = lists:flatten(io_lib:format(\"~p\", [Other])),\n                            \
-                                 io:format(\"\\0JUICE_ERROR\\0~s\\0JUICE_END\\0~n\", [Err]),\n                            \
-                                 loop(Bindings)\n                    \
-                         end\n                \
-                 end\n        \
+                     Other ->\n                    \
+                         Err = lists:flatten(io_lib:format(\"~p\", [Other])),\n                    \
+                         io:format(\"\\0JUICE_ERROR\\0~s\\0JUICE_END\\0~n\", [Err]),\n                    \
+                         loop(Bindings)\n            \
+                 end;\n        \
+             {eval, ExprStr, From} ->\n            \
+                 case catch eval(ExprStr, Bindings) of\n                \
+                     {ok, Value, NewBindings} ->\n                    \
+                         From ! {eval_result, {ok, Value}},\n                    \
+                         loop(NewBindings);\n                \
+                     {error, Reason} ->\n                    \
+                         From ! {eval_result, {error, Reason}},\n                    \
+                         loop(Bindings);\n                \
+                     Other ->\n                    \
+                         From ! {eval_result, {error, Other}},\n                    \
+                         loop(Bindings)\n            \
+                 end\n    \
+         end.\n\
+     \n\
+     remote_eval(ExprStr) ->\n    \
+         juice_shell ! {eval, ExprStr, self()},\n    \
+         receive\n        \
+             {eval_result, {ok, Value}} -> Value;\n        \
+             {eval_result, {error, Reason}} -> error(Reason)\n    \
+         after 30000 ->\n        \
+             error(timeout)\n    \
          end.\n\
      \n\
      eval(ExprStr, Bindings) ->\n    \

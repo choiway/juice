@@ -1,4 +1,7 @@
+use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
+use oxc_parser::Parser;
+use oxc_span::SourceType;
 
 use crate::erlang;
 
@@ -670,6 +673,8 @@ fn compile_call(call: &CallExpression) -> Option<String> {
         compile_node_self(call)
     } else if is_node_list(call) {
         compile_node_list(call)
+    } else if is_node_eval(call) {
+        compile_node_eval(call)
     } else if is_spawn(call) {
         compile_spawn(call)
     } else if is_receive(call) {
@@ -1122,6 +1127,54 @@ fn is_node_list(call: &CallExpression) -> bool {
 
 fn compile_node_list(_call: &CallExpression) -> Option<String> {
     Some("nodes()".to_string())
+}
+
+fn is_node_eval(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "Node" && member.property.name == "eval";
+        }
+    }
+    false
+}
+
+fn compile_node_eval(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 2 {
+        return None;
+    }
+    // First arg: node name string, second arg: JS expression string
+    let node = if let Some(Argument::StringLiteral(s)) = call.arguments.first() {
+        format!("'{}'", s.value)
+    } else {
+        return None;
+    };
+    let js_expr = if let Some(Argument::StringLiteral(s)) = call.arguments.get(1) {
+        s.value.to_string()
+    } else {
+        return None;
+    };
+    // Parse the JS expression and compile it to Erlang
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path("eval.ts").unwrap();
+    let parsed = Parser::new(&allocator, &js_expr, source_type).parse();
+    if !parsed.errors.is_empty() {
+        return None;
+    }
+    let mut exprs: Vec<String> = Vec::new();
+    for stmt in &parsed.program.body {
+        if let Some(erl) = compile_stmt_persistent_repl(stmt) {
+            exprs.push(erl);
+        }
+    }
+    if exprs.is_empty() {
+        return None;
+    }
+    let erl_expr = exprs.join(", ");
+    // Escape any quotes in the compiled Erlang for embedding in a string
+    let escaped = erl_expr.replace('\\', "\\\\").replace('"', "\\\"");
+    Some(format!(
+        "rpc:call({node}, juice_shell, remote_eval, [\"{escaped}\"])"
+    ))
 }
 
 fn is_console_log(call: &CallExpression) -> bool {
