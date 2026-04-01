@@ -1,7 +1,5 @@
 <img src="juice_logo.png" alt="Juice logo" width="200">
 
-# Juice
-
 A JavaScript-to-Erlang compiler that lets you write JS and run it on the BEAM.
 Built for JS developers who want to experience processes, message passing, GenServers, and OTP supervision without learning Erlang syntax.
 
