@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="juice_logo.png" alt="Juice logo" width="200">
+</p>
+
 # Juice
 
 A JavaScript-to-Erlang compiler that lets you write JS and run it on the BEAM.
