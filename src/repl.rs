@@ -1,14 +1,21 @@
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
 use oxc_allocator::Allocator;
-
 use oxc_parser::Parser;
 use oxc_span::SourceType;
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 
 use crate::compiler;
+
+fn history_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".juice_history")
+}
 
 fn friendly_erl_error(raw: &str) -> String {
     // {unbound_var, 'X'} — undefined variable
@@ -61,48 +68,35 @@ fn friendly_erl_error(raw: &str) -> String {
         .to_string()
 }
 
-/// Drain any remaining pasted lines from the channel
-fn drain(rx: &mpsc::Receiver<String>) {
-    // Small delay to let the reader thread catch up with pasted input
-    thread::sleep(std::time::Duration::from_millis(50));
-    while rx.try_recv().is_ok() {}
-}
-
 pub fn run() {
     println!("box v0.1.0 - juice interactive shell");
     println!("Type a JS expression. Ctrl+D to exit.");
     println!();
 
-    let mut stdout = io::stdout();
-
-    // Reader thread sends lines through a channel so we can drain on error
-    let (tx, rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        use io::BufRead;
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(l) => {
-                    if tx.send(l).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    print!("box> ");
-    stdout.flush().unwrap();
+    let mut rl = DefaultEditor::new().expect("Failed to initialize editor");
+    let hist = history_path();
+    let _ = rl.load_history(&hist);
 
     let mut buffer = String::new();
-    let mut history: Vec<String> = Vec::new();
+    let mut erl_defs: Vec<String> = Vec::new();
 
-    while let Ok(line) = rx.recv() {
+    loop {
+        let prompt = if buffer.is_empty() { "box> " } else { "...> " };
+        let line = match rl.readline(prompt) {
+            Ok(l) => l,
+            Err(ReadlineError::Interrupted) => {
+                buffer.clear();
+                continue;
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("Input error: {e}");
+                break;
+            }
+        };
+
         let trimmed = line.trim();
         if trimmed.is_empty() && buffer.is_empty() {
-            print!("box> ");
-            stdout.flush().unwrap();
             continue;
         }
 
@@ -118,21 +112,17 @@ pub fn run() {
         let parser_return = Parser::new(&allocator, &buffer, source_type).parse();
 
         if !parser_return.errors.is_empty() {
-            // If input looks incomplete (unclosed brace/paren), wait for more lines
             if buffer.matches('{').count() > buffer.matches('}').count()
                 || buffer.matches('(').count() > buffer.matches(')').count()
             {
-                print!("...> ");
-                stdout.flush().unwrap();
                 continue;
             }
             eprintln!("Parse error: {}", parser_return.errors[0]);
             buffer.clear();
-            drain(&rx);
-            print!("box> ");
-            stdout.flush().unwrap();
             continue;
         }
+
+        let input_source = buffer.clone();
 
         let mut exprs: Vec<String> = Vec::new();
         let mut new_defs: Vec<String> = Vec::new();
@@ -142,7 +132,6 @@ pub fn run() {
             } else {
                 eprintln!("Unsupported statement");
             }
-            // Only persist variable/function definitions, not side effects
             if matches!(stmt, oxc_ast::ast::Statement::VariableDeclaration(_)) {
                 if let Some(def) = compiler::compile_stmt(stmt) {
                     new_defs.push(def);
@@ -153,12 +142,10 @@ pub fn run() {
         buffer.clear();
 
         if !exprs.is_empty() {
-            let mut all_exprs = history.clone();
+            let mut all_exprs = erl_defs.clone();
             all_exprs.extend(exprs);
-            // In erl -eval, juice_to_string must be a local fun, not a module function
             let to_string_fun = "JuiceToString = fun(V) when is_integer(V) -> integer_to_list(V); (V) when is_float(V) -> float_to_list(V, [{decimals, 10}, compact]); (V) when is_atom(V) -> atom_to_list(V); (V) when is_list(V) -> V; (V) -> lists:flatten(io_lib:format(\"~p\", [V])) end";
             let mut eval_parts = vec![to_string_fun.to_string()];
-            // Rewrite juice_to_string() calls to use the local fun variable
             let rewritten: Vec<String> = all_exprs
                 .iter()
                 .map(|e| e.replace("juice_to_string(", "JuiceToString("))
@@ -180,19 +167,18 @@ pub fn run() {
                     if !out.status.success() {
                         let stderr = String::from_utf8_lossy(&out.stderr);
                         eprintln!("\x1b[31mError: {}\x1b[0m", friendly_erl_error(&stderr));
-                        drain(&rx);
                     } else {
-                        history.extend(new_defs);
+                        erl_defs.extend(new_defs);
                     }
                 }
                 Err(e) => eprintln!("Error running erl: {e}"),
             }
-        }
 
-        print!("box> ");
-        stdout.flush().unwrap();
+            let _ = rl.add_history_entry(&input_source);
+        }
     }
 
+    let _ = rl.save_history(&hist);
     println!("Goodbye!");
 }
 
@@ -366,38 +352,34 @@ pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
     let (result_tx, result_rx) = mpsc::channel::<ShellMessage>();
     start_reader_thread(child_stdout, result_tx);
 
-    // User input channel
-    let (input_tx, input_rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(l) => {
-                    if input_tx.send(l).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
     // Wait for main/0 to complete (starts supervision tree synchronously)
     // Give a brief moment for the shell to enter its eval loop
     thread::sleep(std::time::Duration::from_millis(300));
 
-    let mut stdout = io::stdout();
+    let mut rl = DefaultEditor::new().expect("Failed to initialize editor");
+    let hist = history_path();
+    let _ = rl.load_history(&hist);
+
     let mut erl_stdin = child_stdin;
     let mut buffer = String::new();
 
-    print!("{prompt}");
-    stdout.flush().unwrap();
+    loop {
+        let p = if buffer.is_empty() { prompt.as_str() } else { "...> " };
+        let line = match rl.readline(p) {
+            Ok(l) => l,
+            Err(ReadlineError::Interrupted) => {
+                buffer.clear();
+                continue;
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("Input error: {e}");
+                break;
+            }
+        };
 
-    while let Ok(line) = input_rx.recv() {
         let trimmed = line.trim();
         if trimmed.is_empty() && buffer.is_empty() {
-            print!("{prompt}");
-            stdout.flush().unwrap();
             continue;
         }
 
@@ -417,16 +399,14 @@ pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
             if buffer.matches('{').count() > buffer.matches('}').count()
                 || buffer.matches('(').count() > buffer.matches(')').count()
             {
-                print!("...> ");
-                stdout.flush().unwrap();
                 continue;
             }
             eprintln!("Parse error: {}", parser_return.errors[0]);
             buffer.clear();
-            print!("{prompt}");
-            stdout.flush().unwrap();
             continue;
         }
+
+        let input_source = buffer.clone();
 
         // Compile JS → Erlang expressions
         let mut exprs: Vec<String> = Vec::new();
@@ -440,8 +420,6 @@ pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
         buffer.clear();
 
         if exprs.is_empty() {
-            print!("{prompt}");
-            stdout.flush().unwrap();
             continue;
         }
 
@@ -471,10 +449,10 @@ pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
             }
         }
 
-        print!("{prompt}");
-        stdout.flush().unwrap();
+        let _ = rl.add_history_entry(&input_source);
     }
 
+    let _ = rl.save_history(&hist);
     let _ = child.wait();
     println!("Goodbye!");
 }
@@ -585,33 +563,30 @@ pub fn run_connect(target_node: &str) {
         }
     }
 
-    let (input_tx, input_rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(l) => {
-                    if input_tx.send(l).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let mut rl = DefaultEditor::new().expect("Failed to initialize editor");
+    let hist = history_path();
+    let _ = rl.load_history(&hist);
 
-    let mut stdout = io::stdout();
     let mut erl_stdin = child_stdin;
     let mut buffer = String::new();
 
-    print!("{prompt}");
-    stdout.flush().unwrap();
+    loop {
+        let p = if buffer.is_empty() { prompt.as_str() } else { "...> " };
+        let line = match rl.readline(p) {
+            Ok(l) => l,
+            Err(ReadlineError::Interrupted) => {
+                buffer.clear();
+                continue;
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("Input error: {e}");
+                break;
+            }
+        };
 
-    while let Ok(line) = input_rx.recv() {
         let trimmed = line.trim();
         if trimmed.is_empty() && buffer.is_empty() {
-            print!("{prompt}");
-            stdout.flush().unwrap();
             continue;
         }
 
@@ -630,16 +605,14 @@ pub fn run_connect(target_node: &str) {
             if buffer.matches('{').count() > buffer.matches('}').count()
                 || buffer.matches('(').count() > buffer.matches(')').count()
             {
-                print!("...> ");
-                stdout.flush().unwrap();
                 continue;
             }
             eprintln!("Parse error: {}", parser_return.errors[0]);
             buffer.clear();
-            print!("{prompt}");
-            stdout.flush().unwrap();
             continue;
         }
+
+        let input_source = buffer.clone();
 
         let mut exprs: Vec<String> = Vec::new();
         for stmt in &parser_return.program.body {
@@ -652,8 +625,6 @@ pub fn run_connect(target_node: &str) {
         buffer.clear();
 
         if exprs.is_empty() {
-            print!("{prompt}");
-            stdout.flush().unwrap();
             continue;
         }
 
@@ -681,10 +652,10 @@ pub fn run_connect(target_node: &str) {
             }
         }
 
-        print!("{prompt}");
-        stdout.flush().unwrap();
+        let _ = rl.add_history_entry(&input_source);
     }
 
+    let _ = rl.save_history(&hist);
     let _ = child.wait();
     println!("Goodbye!");
 }

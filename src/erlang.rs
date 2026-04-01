@@ -81,8 +81,7 @@ pub fn case_expression(condition: &str, true_body: &str, false_body: &str) -> St
 
 pub fn fun_expression(params: &[String], body: &str) -> String {
     let params_str = params.join(", ");
-    let inline_body = body.replace('\n', " ");
-    format!("fun({params_str}) -> {inline_body} end")
+    format!("fun({params_str}) ->\n        {body}\n    end")
 }
 
 pub fn spawn_call(fun_expr: &str) -> String {
