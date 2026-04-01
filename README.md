@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="juice_logo.png" alt="Juice logo" width="200">
-</p>
+![Juice logo](juice_logo.png)
 
 # Juice
 
