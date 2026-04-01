@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -6,10 +7,182 @@ use std::thread;
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
+use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::highlight::CmdKind;
+use rustyline::history::DefaultHistory;
+use rustyline::{Editor, Helper};
 
 use crate::compiler;
+
+struct JsHelper;
+
+impl Helper for JsHelper {}
+
+impl Completer for JsHelper {
+    type Candidate = String;
+}
+
+impl Hinter for JsHelper {
+    type Hint = String;
+}
+
+impl Validator for JsHelper {}
+
+impl Highlighter for JsHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        Cow::Owned(highlight_js(line))
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
+        true
+    }
+}
+
+fn highlight_js(line: &str) -> String {
+    const KEYWORD: &str = "\x1b[35m";
+    const LITERAL: &str = "\x1b[33m";
+    const STRING: &str = "\x1b[32m";
+    const NUMBER: &str = "\x1b[33m";
+    const COMMENT: &str = "\x1b[90m";
+    const RESET: &str = "\x1b[0m";
+
+    let mut out = String::with_capacity(line.len() * 2);
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let c = chars[i];
+
+        // Line comment
+        if c == '/' && i + 1 < len && chars[i + 1] == '/' {
+            out.push_str(COMMENT);
+            while i < len {
+                out.push(chars[i]);
+                i += 1;
+            }
+            out.push_str(RESET);
+            continue;
+        }
+
+        // Block comment
+        if c == '/' && i + 1 < len && chars[i + 1] == '*' {
+            out.push_str(COMMENT);
+            out.push('/');
+            out.push('*');
+            i += 2;
+            while i < len {
+                if chars[i] == '*' && i + 1 < len && chars[i + 1] == '/' {
+                    out.push('*');
+                    out.push('/');
+                    i += 2;
+                    break;
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            out.push_str(RESET);
+            continue;
+        }
+
+        // String literals
+        if c == '"' || c == '\'' || c == '`' {
+            let quote = c;
+            out.push_str(STRING);
+            out.push(c);
+            i += 1;
+            while i < len {
+                let sc = chars[i];
+                if sc == '\\' && i + 1 < len {
+                    out.push(sc);
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                out.push(sc);
+                i += 1;
+                if sc == quote {
+                    break;
+                }
+            }
+            out.push_str(RESET);
+            continue;
+        }
+
+        // Numbers
+        if c.is_ascii_digit() || (c == '.' && i + 1 < len && chars[i + 1].is_ascii_digit()) {
+            out.push_str(NUMBER);
+            if c == '0' && i + 1 < len && matches!(chars[i + 1], 'x' | 'X' | 'b' | 'B' | 'o' | 'O')
+            {
+                out.push(c);
+                out.push(chars[i + 1]);
+                i += 2;
+                while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            } else {
+                while i < len && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == '_') {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                if i < len && (chars[i] == 'e' || chars[i] == 'E') {
+                    out.push(chars[i]);
+                    i += 1;
+                    if i < len && (chars[i] == '+' || chars[i] == '-') {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                    while i < len && chars[i].is_ascii_digit() {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                }
+            }
+            out.push_str(RESET);
+            continue;
+        }
+
+        // Identifiers and keywords
+        if c.is_ascii_alphabetic() || c == '_' || c == '$' {
+            let start = i;
+            while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+            {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            match word.as_str() {
+                "let" | "const" | "var" | "function" | "if" | "else" | "for" | "while"
+                | "return" | "new" | "class" | "extends" | "import" | "export" | "async"
+                | "await" | "throw" | "try" | "catch" | "finally" | "switch" | "case"
+                | "break" | "continue" | "typeof" | "instanceof" | "in" | "of" | "default"
+                | "from" | "yield" | "delete" | "void" | "with" | "do" | "debugger"
+                | "static" | "this" | "super" => {
+                    out.push_str(KEYWORD);
+                    out.push_str(&word);
+                    out.push_str(RESET);
+                }
+                "true" | "false" | "null" | "undefined" | "NaN" | "Infinity" => {
+                    out.push_str(LITERAL);
+                    out.push_str(&word);
+                    out.push_str(RESET);
+                }
+                _ => out.push_str(&word),
+            }
+            continue;
+        }
+
+        out.push(c);
+        i += 1;
+    }
+
+    out
+}
+
 
 fn history_path() -> std::path::PathBuf {
     dirs::home_dir()
@@ -73,7 +246,8 @@ pub fn run() {
     println!("Type a JS expression. Ctrl+D to exit.");
     println!();
 
-    let mut rl = DefaultEditor::new().expect("Failed to initialize editor");
+    let mut rl = Editor::<JsHelper, DefaultHistory>::new().expect("Failed to initialize editor");
+    rl.set_helper(Some(JsHelper));
     let hist = history_path();
     let _ = rl.load_history(&hist);
 
@@ -82,9 +256,12 @@ pub fn run() {
 
     loop {
         let prompt = if buffer.is_empty() { "box> " } else { "...> " };
-        let line = match rl.readline(prompt) {
+        let line: String = match rl.readline(prompt) {
             Ok(l) => l,
             Err(ReadlineError::Interrupted) => {
+                if buffer.is_empty() {
+                    break;
+                }
                 buffer.clear();
                 continue;
             }
@@ -356,7 +533,8 @@ pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
     // Give a brief moment for the shell to enter its eval loop
     thread::sleep(std::time::Duration::from_millis(300));
 
-    let mut rl = DefaultEditor::new().expect("Failed to initialize editor");
+    let mut rl = Editor::<JsHelper, DefaultHistory>::new().expect("Failed to initialize editor");
+    rl.set_helper(Some(JsHelper));
     let hist = history_path();
     let _ = rl.load_history(&hist);
 
@@ -365,9 +543,12 @@ pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
 
     loop {
         let p = if buffer.is_empty() { prompt.as_str() } else { "...> " };
-        let line = match rl.readline(p) {
+        let line: String = match rl.readline(p) {
             Ok(l) => l,
             Err(ReadlineError::Interrupted) => {
+                if buffer.is_empty() {
+                    break;
+                }
                 buffer.clear();
                 continue;
             }
@@ -563,7 +744,8 @@ pub fn run_connect(target_node: &str) {
         }
     }
 
-    let mut rl = DefaultEditor::new().expect("Failed to initialize editor");
+    let mut rl = Editor::<JsHelper, DefaultHistory>::new().expect("Failed to initialize editor");
+    rl.set_helper(Some(JsHelper));
     let hist = history_path();
     let _ = rl.load_history(&hist);
 
@@ -572,9 +754,12 @@ pub fn run_connect(target_node: &str) {
 
     loop {
         let p = if buffer.is_empty() { prompt.as_str() } else { "...> " };
-        let line = match rl.readline(p) {
+        let line: String = match rl.readline(p) {
             Ok(l) => l,
             Err(ReadlineError::Interrupted) => {
+                if buffer.is_empty() {
+                    break;
+                }
                 buffer.clear();
                 continue;
             }

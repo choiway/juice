@@ -111,9 +111,12 @@ pub fn compile(module_name: &str, program: &Program) -> CompileResult {
 
     output.push_str(&erlang::function_def("main", &body));
     output.push('\n');
-    output.push('\n');
-    output.push_str(&erlang::to_string_helper());
-    output.push('\n');
+
+    if body.contains("juice_to_string(") {
+        output.push('\n');
+        output.push_str(&erlang::to_string_helper());
+        output.push('\n');
+    }
 
     if genserver.is_some() {
         output.push('\n');
@@ -138,10 +141,6 @@ pub fn compile(module_name: &str, program: &Program) -> CompileResult {
         source: output,
         needs_supervisor,
     }
-}
-
-pub fn compile_expr(expr: &Expression) -> Option<String> {
-    compile_expression(expr)
 }
 
 pub fn compile_stmt(stmt: &Statement) -> Option<String> {
@@ -2022,8 +2021,14 @@ mod tests {
 
     #[test]
     fn to_string_helper_has_map_clause() {
-        let erl = compile_js("console.log(\"hi\")");
+        let erl = compile_js("console.log(\"hello \" + name)");
         assert!(erl.contains("is_map(V)"));
+    }
+
+    #[test]
+    fn to_string_helper_omitted_when_unused() {
+        let erl = compile_js("console.log(\"hi\")");
+        assert!(!erl.contains("juice_to_string"));
     }
 
     // === ReturnStatement ===
