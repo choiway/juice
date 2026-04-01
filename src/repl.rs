@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -10,37 +10,52 @@ use oxc_span::SourceType;
 
 use crate::compiler;
 
-fn friendly_erl_error(stderr: &str) -> String {
-    // Pattern 1: {{error_type, detail}, stacktrace}  (e.g. unbound_var)
-    if let Some(start) = stderr.find("{{") {
-        let rest = &stderr[start + 2..];
+fn friendly_erl_error(raw: &str) -> String {
+    // {unbound_var, 'X'} — undefined variable
+    if let Some(start) = raw.find("{unbound_var,") {
+        let rest = &raw[start + "{unbound_var,".len()..];
         if let Some(end) = rest.find('}') {
-            let reason = &rest[..end];
-            if let Some((_kind, detail)) = reason.split_once(',') {
-                let detail = detail.trim().trim_matches('\'');
-                if reason.starts_with("unbound_var") {
-                    return format!("undefined variable '{detail}'");
-                }
-            }
-            return reason.to_string();
+            let var = rest[..end].trim().trim_matches('\'');
+            return format!("undefined variable '{var}'");
         }
     }
-    // Pattern 2: ({error_type, stacktrace})  (e.g. badarg, badarith)
-    if let Some(start) = stderr.find("({") {
-        let rest = &stderr[start + 2..];
-        if let Some(end) = rest.find(',') {
-            let error_type = &rest[..end];
-            return match error_type {
-                "badarg" => "bad argument".to_string(),
-                "badarith" => "arithmetic error".to_string(),
-                "function_clause" => "no matching function clause".to_string(),
-                other => other.to_string(),
-            };
+    // {unbound, 'Foo'} — undefined function (called but never assigned)
+    if let Some(start) = raw.find("{unbound,") {
+        let rest = &raw[start + "{unbound,".len()..];
+        if let Some(end) = rest.find('}') {
+            let name = rest[..end].trim().trim_matches('\'');
+            return format!("undefined function '{name}'");
         }
     }
-    // Fallback: first non-empty line, stripped of crash dump noise
-    stderr
-        .lines()
+    // {{badmatch,...}} — pattern match failure
+    if raw.contains("{badmatch,") {
+        return "no match for right-hand side value".to_string();
+    }
+    // {badarith,...} — arithmetic error
+    if raw.contains("{badarith,") {
+        return "arithmetic error".to_string();
+    }
+    // {badarg,...}
+    if raw.contains("{badarg,") {
+        return "bad argument".to_string();
+    }
+    // {function_clause,...}
+    if raw.contains("{function_clause,") {
+        return "no matching function clause".to_string();
+    }
+    // {error, <<"reason">>} — user throw/error
+    if let Some(start) = raw.find("{error,<<\"") {
+        let rest = &raw[start + "{error,<<\"".len()..];
+        if let Some(end) = rest.find("\">>") {
+            return rest[..end].to_string();
+        }
+    }
+    // {noproc,...} — process not found (e.g. GenServer.call to dead process)
+    if raw.contains("{noproc,") {
+        return "process not found".to_string();
+    }
+    // Fallback: first non-empty line, stripped of noise
+    raw.lines()
         .find(|l| !l.is_empty() && !l.contains("Crash dump") && !l.contains("Runtime terminating"))
         .unwrap_or("runtime error")
         .to_string()
@@ -144,7 +159,8 @@ pub fn run() {
             let to_string_fun = "JuiceToString = fun(V) when is_integer(V) -> integer_to_list(V); (V) when is_float(V) -> float_to_list(V, [{decimals, 10}, compact]); (V) when is_atom(V) -> atom_to_list(V); (V) when is_list(V) -> V; (V) -> lists:flatten(io_lib:format(\"~p\", [V])) end";
             let mut eval_parts = vec![to_string_fun.to_string()];
             // Rewrite juice_to_string() calls to use the local fun variable
-            let rewritten: Vec<String> = all_exprs.iter()
+            let rewritten: Vec<String> = all_exprs
+                .iter()
                 .map(|e| e.replace("juice_to_string(", "JuiceToString("))
                 .collect();
             eval_parts.extend(rewritten);
@@ -185,33 +201,127 @@ enum ShellMessage {
     Error(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedShellChunk {
+    PassThrough(String),
+    Result(String),
+    Error(String),
+}
+
+const RESULT_PREFIX: &str = "\0JUICE_RESULT\0";
+const ERROR_PREFIX: &str = "\0JUICE_ERROR\0";
+const END_MARKER: &str = "\0JUICE_END\0";
+
+fn next_shell_frame(buffer: &str) -> Option<(usize, bool)> {
+    let result_pos = buffer.find(RESULT_PREFIX);
+    let error_pos = buffer.find(ERROR_PREFIX);
+
+    match (result_pos, error_pos) {
+        (Some(r), Some(e)) => Some(if r <= e { (r, true) } else { (e, false) }),
+        (Some(r), None) => Some((r, true)),
+        (None, Some(e)) => Some((e, false)),
+        (None, None) => None,
+    }
+}
+
+fn drain_shell_output(buffer: &mut String, flush_partial: bool) -> Vec<ParsedShellChunk> {
+    let mut chunks = Vec::new();
+
+    loop {
+        match next_shell_frame(buffer) {
+            Some((start, is_result)) => {
+                if start > 0 {
+                    chunks.push(ParsedShellChunk::PassThrough(buffer[..start].to_string()));
+                    buffer.drain(..start);
+                    continue;
+                }
+
+                let prefix = if is_result {
+                    RESULT_PREFIX
+                } else {
+                    ERROR_PREFIX
+                };
+                let payload_start = prefix.len();
+                let Some(end_rel) = buffer[payload_start..].find(END_MARKER) else {
+                    break;
+                };
+
+                let payload_end = payload_start + end_rel;
+                let payload = buffer[payload_start..payload_end].to_string();
+                if is_result {
+                    chunks.push(ParsedShellChunk::Result(payload));
+                } else {
+                    chunks.push(ParsedShellChunk::Error(payload));
+                }
+
+                let mut drain_len = payload_end + END_MARKER.len();
+                if buffer[drain_len..].starts_with("\r\n") {
+                    drain_len += 2;
+                } else if buffer[drain_len..].starts_with('\n')
+                    || buffer[drain_len..].starts_with('\r')
+                {
+                    drain_len += 1;
+                }
+                buffer.drain(..drain_len);
+            }
+            None => {
+                if flush_partial {
+                    if !buffer.is_empty() {
+                        chunks.push(ParsedShellChunk::PassThrough(std::mem::take(buffer)));
+                    }
+                } else if let Some(last_newline) = buffer.rfind('\n') {
+                    let split = last_newline + 1;
+                    chunks.push(ParsedShellChunk::PassThrough(buffer[..split].to_string()));
+                    buffer.drain(..split);
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    chunks
+}
+
+fn emit_shell_chunks(chunks: Vec<ParsedShellChunk>, tx: &mpsc::Sender<ShellMessage>) {
+    for chunk in chunks {
+        match chunk {
+            ParsedShellChunk::PassThrough(text) => {
+                print!("{text}");
+                let _ = io::stdout().flush();
+            }
+            ParsedShellChunk::Result(value) => {
+                let _ = tx.send(ShellMessage::Result(value));
+            }
+            ParsedShellChunk::Error(value) => {
+                let _ = tx.send(ShellMessage::Error(value));
+            }
+        }
+    }
+}
+
 /// Parse stdout from the Erlang eval server, extracting delimited results.
 /// Non-delimited output (io:format from user code) is printed directly.
-fn start_reader_thread(
-    stdout: std::process::ChildStdout,
-    tx: mpsc::Sender<ShellMessage>,
-) {
+fn start_reader_thread(mut stdout: std::process::ChildStdout, tx: mpsc::Sender<ShellMessage>) {
     thread::spawn(move || {
-        let reader = io::BufReader::new(stdout);
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            if let Some(rest) = line.strip_prefix("\0JUICE_RESULT\0") {
-                if let Some(value) = rest.strip_suffix("\0JUICE_END\0") {
-                    let _ = tx.send(ShellMessage::Result(value.to_string()));
-                    continue;
+        let mut raw = [0_u8; 4096];
+        let mut buffer = String::new();
+
+        loop {
+            match stdout.read(&mut raw) {
+                Ok(0) => {
+                    emit_shell_chunks(drain_shell_output(&mut buffer, true), &tx);
+                    break;
+                }
+                Ok(n) => {
+                    buffer.push_str(&String::from_utf8_lossy(&raw[..n]));
+                    emit_shell_chunks(drain_shell_output(&mut buffer, false), &tx);
+                }
+                Err(_) => {
+                    emit_shell_chunks(drain_shell_output(&mut buffer, true), &tx);
+                    break;
                 }
             }
-            if let Some(rest) = line.strip_prefix("\0JUICE_ERROR\0") {
-                if let Some(value) = rest.strip_suffix("\0JUICE_END\0") {
-                    let _ = tx.send(ShellMessage::Error(value.to_string()));
-                    continue;
-                }
-            }
-            // Pass-through: io:format output from user code / OTP reports
-            println!("{line}");
         }
     });
 }
@@ -226,8 +336,15 @@ pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
 
     let mut cmd = Command::new("erl");
     cmd.arg("-noshell")
-        .arg("-pa").arg(".")
-        .arg("-s").arg("juice_shell").arg("start").arg(module_name)
+        .arg("-pa")
+        .arg(".")
+        .arg("-kernel")
+        .arg("logger")
+        .arg("[{handler, default, logger_std_h, #{config => #{type => standard_error}}}]")
+        .arg("-s")
+        .arg("juice_shell")
+        .arg("start")
+        .arg(module_name)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -346,7 +463,7 @@ pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
                 println!("\x1b[36m{value}\x1b[0m");
             }
             Ok(ShellMessage::Error(err)) => {
-                eprintln!("\x1b[31mError: {err}\x1b[0m");
+                eprintln!("\x1b[31mError: {}\x1b[0m", friendly_erl_error(&err));
             }
             Err(_) => {
                 eprintln!("VM process exited");
@@ -362,9 +479,59 @@ pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
     println!("Goodbye!");
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{drain_shell_output, ParsedShellChunk, END_MARKER, ERROR_PREFIX, RESULT_PREFIX};
+
+    #[test]
+    fn parses_multiline_error_frames() {
+        let mut buffer = format!("{ERROR_PREFIX}{{'EXIT',\n  crash}}{END_MARKER}\n");
+
+        let chunks = drain_shell_output(&mut buffer, false);
+        assert_eq!(
+            chunks,
+            vec![ParsedShellChunk::Error("{'EXIT',\n  crash}".to_string())]
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn preserves_passthrough_between_frames() {
+        let mut buffer = format!("hello\n{RESULT_PREFIX}ok{END_MARKER}\nworld\n");
+
+        let chunks = drain_shell_output(&mut buffer, false);
+        assert_eq!(
+            chunks,
+            vec![
+                ParsedShellChunk::PassThrough("hello\n".to_string()),
+                ParsedShellChunk::Result("ok".to_string()),
+                ParsedShellChunk::PassThrough("world\n".to_string()),
+            ]
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn waits_for_complete_frames_across_reads() {
+        let mut buffer = format!("{ERROR_PREFIX}partial");
+        assert!(drain_shell_output(&mut buffer, false).is_empty());
+
+        buffer.push_str(&format!("\nframe{END_MARKER}\n"));
+        let chunks = drain_shell_output(&mut buffer, false);
+        assert_eq!(
+            chunks,
+            vec![ParsedShellChunk::Error("partial\nframe".to_string())]
+        );
+        assert!(buffer.is_empty());
+    }
+}
+
 /// Run a REPL connected to a remote Erlang node.
 pub fn run_connect(target_node: &str) {
-    let prompt = format!("juice@{}> ", target_node.split('@').next().unwrap_or(target_node));
+    let prompt = format!(
+        "juice@{}> ",
+        target_node.split('@').next().unwrap_or(target_node)
+    );
 
     // Generate a unique client node name
     let client_name = format!("juice_client_{}", std::process::id());
@@ -372,10 +539,19 @@ pub fn run_connect(target_node: &str) {
     let mut cmd = Command::new("erl");
     cmd.arg("-noshell")
         .arg("-hidden")
-        .arg("-pa").arg(".")
-        .arg("-sname").arg(&client_name)
-        .arg("-setcookie").arg("juice")
-        .arg("-s").arg("juice_remote_shell").arg("start").arg(target_node)
+        .arg("-pa")
+        .arg(".")
+        .arg("-kernel")
+        .arg("logger")
+        .arg("[{handler, default, logger_std_h, #{config => #{type => standard_error}}}]")
+        .arg("-sname")
+        .arg(&client_name)
+        .arg("-setcookie")
+        .arg("juice")
+        .arg("-s")
+        .arg("juice_remote_shell")
+        .arg("start")
+        .arg(target_node)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -497,7 +673,7 @@ pub fn run_connect(target_node: &str) {
                 println!("\x1b[36m{value}\x1b[0m");
             }
             Ok(ShellMessage::Error(err)) => {
-                eprintln!("\x1b[31mError: {err}\x1b[0m");
+                eprintln!("\x1b[31mError: {}\x1b[0m", friendly_erl_error(&err));
             }
             Err(_) => {
                 eprintln!("VM process exited");

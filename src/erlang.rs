@@ -7,7 +7,10 @@ pub fn behaviour_attribute(name: &str) -> String {
 }
 
 pub fn export_attribute(funs: &[(&str, usize)]) -> String {
-    let exports: Vec<String> = funs.iter().map(|(name, arity)| format!("{name}/{arity}")).collect();
+    let exports: Vec<String> = funs
+        .iter()
+        .map(|(name, arity)| format!("{name}/{arity}"))
+        .collect();
     format!("-export([{}]).", exports.join(", "))
 }
 
@@ -78,7 +81,8 @@ pub fn case_expression(condition: &str, true_body: &str, false_body: &str) -> St
 
 pub fn fun_expression(params: &[String], body: &str) -> String {
     let params_str = params.join(", ");
-    format!("fun({params_str}) ->\n        {body}\n    end")
+    let inline_body = body.replace('\n', " ");
+    format!("fun({params_str}) -> {inline_body} end")
 }
 
 pub fn spawn_call(fun_expr: &str) -> String {
@@ -218,13 +222,13 @@ pub fn gen_server_start_helper() -> String {
     "juice_gen_server_start(Module) ->\n    \
      {ok, Pid} = gen_server:start_link(Module, [], []),\n    \
      Pid."
-    .to_string()
+        .to_string()
 }
 
 pub fn gen_server_start_link_helper() -> String {
     "juice_gen_server_start_link(Module) ->\n    \
      gen_server:start_link(Module, [], [])."
-    .to_string()
+        .to_string()
 }
 
 pub fn erlang_error(reason: &str) -> String {
@@ -258,20 +262,20 @@ pub fn supervisor_module() -> String {
                  timer:sleep(10),\n            \
                  find_child(SupPid, Id, Retries - 1)\n    \
          end.\n"
-    .to_string()
+        .to_string()
 }
 
 pub fn gen_server_start_named_helper() -> String {
     "juice_gen_server_start_named(Module, Name) ->\n    \
      {ok, Pid} = gen_server:start_link({local, Name}, Module, [], []),\n    \
      Pid."
-    .to_string()
+        .to_string()
 }
 
 pub fn gen_server_start_link_named_helper() -> String {
     "juice_gen_server_start_link_named(Module, Name) ->\n    \
      gen_server:start_link({local, Name}, Module, [], [])."
-    .to_string()
+        .to_string()
 }
 
 pub fn shell_module() -> String {
@@ -280,7 +284,7 @@ pub fn shell_module() -> String {
      \n\
      start([UserModule]) ->\n    \
          process_flag(trap_exit, true),\n    \
-         UserModule:main(),\n    \
+         UserModule:main(),\n\
          loop(erl_eval:new_bindings()).\n\
      \n\
      loop(Bindings) ->\n    \

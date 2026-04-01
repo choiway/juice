@@ -49,7 +49,9 @@ pub fn compile(module_name: &str, program: &Program) -> CompileResult {
     }
 
     let uses_spawn = body_lines.iter().any(|line| line.contains("erlang:spawn("));
-    let uses_named_genserver = body_lines.iter().any(|line| line.contains("start_named(") || line.contains("start_link_named"));
+    let uses_named_genserver = body_lines
+        .iter()
+        .any(|line| line.contains("start_named(") || line.contains("start_link_named"));
 
     let body = if body_lines.is_empty() {
         "ok".to_string()
@@ -70,7 +72,11 @@ pub fn compile(module_name: &str, program: &Program) -> CompileResult {
         output.push_str(&erlang::behaviour_attribute("gen_server"));
         output.push('\n');
         let mut exports: Vec<(&str, usize)> = vec![
-            ("main", 0), ("init", 1), ("handle_call", 3), ("handle_cast", 2), ("handle_info", 2),
+            ("main", 0),
+            ("init", 1),
+            ("handle_call", 3),
+            ("handle_cast", 2),
+            ("handle_info", 2),
         ];
         if needs_supervisor {
             exports.push(("juice_gen_server_start_link", 1));
@@ -142,17 +148,15 @@ pub fn compile_stmt(stmt: &Statement) -> Option<String> {
 /// Pre-scan: does this statement contain a Supervisor.start call?
 fn detect_supervisor_usage(stmt: &Statement) -> bool {
     match stmt {
-        Statement::VariableDeclaration(decl) => {
-            decl.declarations.iter().any(|d| {
-                d.init.as_ref().is_some_and(|expr| {
-                    if let Expression::CallExpression(call) = expr {
-                        is_supervisor_start(call)
-                    } else {
-                        false
-                    }
-                })
+        Statement::VariableDeclaration(decl) => decl.declarations.iter().any(|d| {
+            d.init.as_ref().is_some_and(|expr| {
+                if let Expression::CallExpression(call) = expr {
+                    is_supervisor_start(call)
+                } else {
+                    false
+                }
             })
-        }
+        }),
         Statement::ExpressionStatement(expr_stmt) => {
             if let Expression::CallExpression(call) = &expr_stmt.expression {
                 is_supervisor_start(call)
@@ -194,12 +198,15 @@ fn detect_genserver<'a>(decl: &'a VariableDeclaration<'a>) -> Option<GenServerDe
     }
 
     let init_body = init_body?;
-    Some(GenServerDef { init_body, handle_call, handle_cast })
+    Some(GenServerDef {
+        init_body,
+        handle_call,
+        handle_cast,
+    })
 }
 
 fn compile_init_callback(gs: &GenServerDef) -> String {
-    let body = compile_function_body(gs.init_body)
-        .unwrap_or_else(|| "ok".to_string());
+    let body = compile_function_body(gs.init_body).unwrap_or_else(|| "ok".to_string());
     erlang::init_function(&body)
 }
 
@@ -208,8 +215,7 @@ fn compile_handle_call_callback(gs: &GenServerDef) -> String {
         Some((params, body)) => {
             let msg_param = extract_param(params, 0, "Msg");
             let state_param = extract_param(params, 1, "State");
-            let body_str = compile_function_body(body)
-                .unwrap_or_else(|| "ok".to_string());
+            let body_str = compile_function_body(body).unwrap_or_else(|| "ok".to_string());
             erlang::handle_call_function(&msg_param, &state_param, &body_str)
         }
         None => "handle_call(_Msg, _From, State) ->\n    {reply, ok, State}.".to_string(),
@@ -221,8 +227,7 @@ fn compile_handle_cast_callback(gs: &GenServerDef) -> String {
         Some((params, body)) => {
             let msg_param = extract_param(params, 0, "Msg");
             let state_param = extract_param(params, 1, "State");
-            let body_str = compile_function_body(body)
-                .unwrap_or_else(|| "ok".to_string());
+            let body_str = compile_function_body(body).unwrap_or_else(|| "ok".to_string());
             erlang::handle_cast_function(&msg_param, &state_param, &body_str)
         }
         None => erlang::default_handle_cast(),
@@ -230,7 +235,9 @@ fn compile_handle_cast_callback(gs: &GenServerDef) -> String {
 }
 
 fn extract_param(params: &FormalParameters, index: usize, default: &str) -> String {
-    params.items.get(index)
+    params
+        .items
+        .get(index)
         .and_then(|param| match &param.pattern {
             BindingPattern::BindingIdentifier(ident) => Some(erlang::js_var_to_erlang(&ident.name)),
             _ => None,
@@ -283,6 +290,7 @@ fn compile_statement(stmt: &Statement) -> Option<String> {
         Statement::ForStatement(for_stmt) => compile_for_statement(for_stmt),
         Statement::ReturnStatement(ret) => compile_return_statement(ret),
         Statement::ThrowStatement(throw_stmt) => compile_throw_statement(throw_stmt),
+        Statement::FunctionDeclaration(func) => compile_function_declaration(func),
         _ => None,
     }
 }
@@ -370,10 +378,14 @@ fn compile_expression(expr: &Expression) -> Option<String> {
 }
 
 fn compile_array(array: &ArrayExpression) -> Option<String> {
-    let elements: Vec<String> = array.elements.iter().filter_map(|elem| {
-        let expr = elem.as_expression()?;
-        compile_expression(expr)
-    }).collect();
+    let elements: Vec<String> = array
+        .elements
+        .iter()
+        .filter_map(|elem| {
+            let expr = elem.as_expression()?;
+            compile_expression(expr)
+        })
+        .collect();
     Some(erlang::tuple_literal(&elements))
 }
 
@@ -403,20 +415,42 @@ fn compile_member_access(member: &StaticMemberExpression) -> Option<String> {
     Some(erlang::maps_get(&property, &object))
 }
 
-fn compile_arrow_function(arrow: &ArrowFunctionExpression) -> Option<String> {
-    let params: Vec<String> = arrow.params.items.iter().filter_map(|param| {
-        match &param.pattern {
+fn compile_function_declaration(func: &Function) -> Option<String> {
+    let name = erlang::js_var_to_erlang(&func.id.as_ref()?.name);
+    let params: Vec<String> = func
+        .params
+        .items
+        .iter()
+        .filter_map(|param| match &param.pattern {
             BindingPattern::BindingIdentifier(ident) => Some(erlang::js_var_to_erlang(&ident.name)),
             _ => None,
-        }
-    }).collect();
+        })
+        .collect();
+    let body = compile_function_body(func.body.as_ref()?)?;
+    Some(format!("{name} = {}", erlang::fun_expression(&params, &body)))
+}
+
+fn compile_arrow_function(arrow: &ArrowFunctionExpression) -> Option<String> {
+    let params: Vec<String> = arrow
+        .params
+        .items
+        .iter()
+        .filter_map(|param| match &param.pattern {
+            BindingPattern::BindingIdentifier(ident) => Some(erlang::js_var_to_erlang(&ident.name)),
+            _ => None,
+        })
+        .collect();
 
     let body = compile_function_body(&arrow.body)?;
     Some(erlang::fun_expression(&params, &body))
 }
 
 fn compile_receive_body(body: &FunctionBody) -> Option<String> {
-    let lines: Vec<String> = body.statements.iter().filter_map(|s| compile_statement(s)).collect();
+    let lines: Vec<String> = body
+        .statements
+        .iter()
+        .filter_map(|s| compile_statement(s))
+        .collect();
     if lines.is_empty() {
         Some("ok".to_string())
     } else {
@@ -425,7 +459,11 @@ fn compile_receive_body(body: &FunctionBody) -> Option<String> {
 }
 
 fn compile_function_body(body: &FunctionBody) -> Option<String> {
-    let lines: Vec<String> = body.statements.iter().filter_map(|s| compile_statement(s)).collect();
+    let lines: Vec<String> = body
+        .statements
+        .iter()
+        .filter_map(|s| compile_statement(s))
+        .collect();
     if lines.is_empty() {
         Some("ok".to_string())
     } else {
@@ -483,13 +521,22 @@ fn compile_for_statement(for_stmt: &ForStatement) -> Option<String> {
     // 4. Compile body
     let body = compile_for_body(&for_stmt.body)?;
 
-    Some(erlang::foreach_seq(&var_name, &init_value, &upper_bound, &body))
+    Some(erlang::foreach_seq(
+        &var_name,
+        &init_value,
+        &upper_bound,
+        &body,
+    ))
 }
 
 fn compile_for_body(stmt: &Statement) -> Option<String> {
     match stmt {
         Statement::BlockStatement(block) => {
-            let lines: Vec<String> = block.body.iter().filter_map(|s| compile_statement(s)).collect();
+            let lines: Vec<String> = block
+                .body
+                .iter()
+                .filter_map(|s| compile_statement(s))
+                .collect();
             if lines.is_empty() {
                 Some("ok".to_string())
             } else {
@@ -513,7 +560,11 @@ fn compile_if_statement(if_stmt: &IfStatement) -> Option<String> {
 fn compile_block_statement(stmt: &Statement) -> Option<String> {
     match stmt {
         Statement::BlockStatement(block) => {
-            let lines: Vec<String> = block.body.iter().filter_map(|s| compile_statement(s)).collect();
+            let lines: Vec<String> = block
+                .body
+                .iter()
+                .filter_map(|s| compile_statement(s))
+                .collect();
             if lines.is_empty() {
                 Some("ok".to_string())
             } else {
@@ -572,8 +623,7 @@ fn compile_string_operand(expr: &Expression) -> Option<String> {
 }
 
 fn compile_binary_expression(bin: &BinaryExpression) -> Option<String> {
-    if bin.operator.as_str() == "+"
-        && (is_string_concat(&bin.left) || is_string_concat(&bin.right))
+    if bin.operator.as_str() == "+" && (is_string_concat(&bin.left) || is_string_concat(&bin.right))
     {
         let left = compile_string_operand(&bin.left)?;
         let right = compile_string_operand(&bin.right)?;
@@ -630,7 +680,11 @@ fn compile_call(call: &CallExpression) -> Option<String> {
         compile_self(call)
     } else if let Expression::Identifier(ident) = &call.callee {
         let func_name = erlang::js_var_to_erlang(&ident.name);
-        let args: Vec<String> = call.arguments.iter().filter_map(|a| compile_argument(a)).collect();
+        let args: Vec<String> = call
+            .arguments
+            .iter()
+            .filter_map(|a| compile_argument(a))
+            .collect();
         Some(format!("{}({})", func_name, args.join(", ")))
     } else {
         None
@@ -1090,7 +1144,11 @@ mod tests {
         let allocator = Allocator::default();
         let source_type = SourceType::from_path("test.ts").unwrap();
         let parsed = Parser::new(&allocator, source, source_type).parse();
-        assert!(parsed.errors.is_empty(), "Parse errors: {:?}", parsed.errors);
+        assert!(
+            parsed.errors.is_empty(),
+            "Parse errors: {:?}",
+            parsed.errors
+        );
         compile("test", &parsed.program).source
     }
 
@@ -1110,7 +1168,10 @@ mod tests {
 
     #[test]
     fn float_literal() {
-        assert_eq!(main_body("console.log(3.14)"), "io:format(\"~p~n\", [3.14])");
+        assert_eq!(
+            main_body("console.log(3.14)"),
+            "io:format(\"~p~n\", [3.14])"
+        );
     }
 
     #[test]
@@ -1165,7 +1226,11 @@ mod tests {
         let allocator = Allocator::default();
         let source_type = SourceType::from_path("repl.ts").unwrap();
         let parsed = Parser::new(&allocator, source, source_type).parse();
-        assert!(parsed.errors.is_empty(), "Parse errors: {:?}", parsed.errors);
+        assert!(
+            parsed.errors.is_empty(),
+            "Parse errors: {:?}",
+            parsed.errors
+        );
         parsed
             .program
             .body
@@ -1176,22 +1241,34 @@ mod tests {
 
     #[test]
     fn repl_bare_expression_prints() {
-        assert_eq!(repl_compile("1 + 1"), vec!["io:format(\"~p~n\", [(1 + 1)])"]);
+        assert_eq!(
+            repl_compile("1 + 1"),
+            vec!["io:format(\"~p~n\", [(1 + 1)])"]
+        );
     }
 
     #[test]
     fn repl_bare_identifier_prints() {
-        assert_eq!(repl_compile("const x = 10\nx"), vec!["X = 10", "io:format(\"~p~n\", [X])"]);
+        assert_eq!(
+            repl_compile("const x = 10\nx"),
+            vec!["X = 10", "io:format(\"~p~n\", [X])"]
+        );
     }
 
     #[test]
     fn repl_console_log_not_double_wrapped() {
-        assert_eq!(repl_compile("console.log(42)"), vec!["io:format(\"~p~n\", [42])"]);
+        assert_eq!(
+            repl_compile("console.log(42)"),
+            vec!["io:format(\"~p~n\", [42])"]
+        );
     }
 
     #[test]
     fn repl_console_log_string_not_double_wrapped() {
-        assert_eq!(repl_compile("console.log(\"hi\")"), vec!["io:format(\"hi~n\")"]);
+        assert_eq!(
+            repl_compile("console.log(\"hi\")"),
+            vec!["io:format(\"hi~n\")"]
+        );
     }
 
     #[test]
@@ -1491,10 +1568,7 @@ mod tests {
 
     #[test]
     fn send_no_spawn_no_sleep() {
-        assert_eq!(
-            main_body("send(pid, \"hello\")"),
-            "Pid ! hello"
-        );
+        assert_eq!(main_body("send(pid, \"hello\")"), "Pid ! hello");
     }
 
     // --- Self ---
@@ -1511,10 +1585,7 @@ mod tests {
 
     #[test]
     fn tuple_basic() {
-        assert_eq!(
-            main_body("const t = [1, 2, 3]"),
-            "T = {1, 2, 3}"
-        );
+        assert_eq!(main_body("const t = [1, 2, 3]"), "T = {1, 2, 3}");
     }
 
     #[test]
@@ -1543,28 +1614,19 @@ mod tests {
 
     #[test]
     fn tuple_nested() {
-        assert_eq!(
-            main_body("const t = [1, [2, 3]]"),
-            "T = {1, {2, 3}}"
-        );
+        assert_eq!(main_body("const t = [1, [2, 3]]"), "T = {1, {2, 3}}");
     }
 
     #[test]
     fn tuple_empty() {
-        assert_eq!(
-            main_body("const t = []"),
-            "T = {}"
-        );
+        assert_eq!(main_body("const t = []"), "T = {}");
     }
 
     // --- Atoms ---
 
     #[test]
     fn atom_in_send() {
-        assert_eq!(
-            main_body("send(pid, \"hello\")"),
-            "Pid ! hello"
-        );
+        assert_eq!(main_body("send(pid, \"hello\")"), "Pid ! hello");
     }
 
     #[test]
@@ -1787,10 +1849,7 @@ mod tests {
 
     #[test]
     fn object_literal_empty() {
-        assert_eq!(
-            main_body("const obj = {}"),
-            "Obj = #{}"
-        );
+        assert_eq!(main_body("const obj = {}"), "Obj = #{}");
     }
 
     #[test]
@@ -1873,10 +1932,7 @@ mod tests {
     #[test]
     fn object_uppercase_key_quoted() {
         // PascalCase starts uppercase → must be single-quoted to avoid variable
-        assert_eq!(
-            main_body("const m = { MyKey: 1 }"),
-            "M = #{'MyKey' => 1}"
-        );
+        assert_eq!(main_body("const m = { MyKey: 1 }"), "M = #{'MyKey' => 1}");
     }
 
     #[test]
@@ -1889,10 +1945,7 @@ mod tests {
 
     #[test]
     fn object_dollar_key_quoted() {
-        assert_eq!(
-            main_body("const m = { $ref: 1 }"),
-            "M = #{'$ref' => 1}"
-        );
+        assert_eq!(main_body("const m = { $ref: 1 }"), "M = #{'$ref' => 1}");
     }
 
     #[test]
@@ -1992,22 +2045,37 @@ mod tests {
     #[test]
     fn genserver_module_has_behaviour() {
         let erl = compile_js(genserver_source());
-        assert!(erl.contains("-behaviour(gen_server)."), "missing behaviour: {erl}");
+        assert!(
+            erl.contains("-behaviour(gen_server)."),
+            "missing behaviour: {erl}"
+        );
     }
 
     #[test]
     fn genserver_module_exports_callbacks() {
         let erl = compile_js(genserver_source());
         assert!(erl.contains("init/1"), "missing init export: {erl}");
-        assert!(erl.contains("handle_call/3"), "missing handle_call export: {erl}");
-        assert!(erl.contains("handle_cast/2"), "missing handle_cast export: {erl}");
-        assert!(erl.contains("handle_info/2"), "missing handle_info export: {erl}");
+        assert!(
+            erl.contains("handle_call/3"),
+            "missing handle_call export: {erl}"
+        );
+        assert!(
+            erl.contains("handle_cast/2"),
+            "missing handle_cast export: {erl}"
+        );
+        assert!(
+            erl.contains("handle_info/2"),
+            "missing handle_info export: {erl}"
+        );
     }
 
     #[test]
     fn genserver_init_callback() {
         let erl = compile_js(genserver_source());
-        assert!(erl.contains("init(_Args) ->\n    {ok, #{count => 0}}."), "missing init callback: {erl}");
+        assert!(
+            erl.contains("init(_Args) ->\n    {ok, #{count => 0}}."),
+            "missing init callback: {erl}"
+        );
     }
 
     #[test]
@@ -2016,7 +2084,10 @@ mod tests {
         // main/0 should NOT contain the Counter map definition
         let main_start = erl.find("main() ->").expect("no main");
         let main_section = &erl[main_start..];
-        assert!(!main_section.contains("Counter ="), "Counter definition should be skipped in main: {main_section}");
+        assert!(
+            !main_section.contains("Counter ="),
+            "Counter definition should be skipped in main: {main_section}"
+        );
     }
 
     // === handle_call callback ===
@@ -2024,17 +2095,32 @@ mod tests {
     #[test]
     fn genserver_handle_call_callback() {
         let erl = compile_js(genserver_source());
-        assert!(erl.contains("handle_call(Msg, _From, State) ->"), "missing handle_call signature: {erl}");
-        assert!(erl.contains("#{reply := __Reply, state := __NewState}"), "missing map pattern match: {erl}");
-        assert!(erl.contains("{reply, __Reply, __NewState}"), "missing reply tuple: {erl}");
-        assert!(erl.contains("{reply, {error, unhandled}, State}"), "missing fallback: {erl}");
+        assert!(
+            erl.contains("handle_call(Msg, _From, State) ->"),
+            "missing handle_call signature: {erl}"
+        );
+        assert!(
+            erl.contains("#{reply := __Reply, state := __NewState}"),
+            "missing map pattern match: {erl}"
+        );
+        assert!(
+            erl.contains("{reply, __Reply, __NewState}"),
+            "missing reply tuple: {erl}"
+        );
+        assert!(
+            erl.contains("{reply, {error, unhandled}, State}"),
+            "missing fallback: {erl}"
+        );
     }
 
     #[test]
     fn genserver_handle_call_body_compiles() {
         let erl = compile_js(genserver_source());
         // The if/else-if chain should produce nested case expressions
-        assert!(erl.contains("Msg =:= increment"), "missing increment case: {erl}");
+        assert!(
+            erl.contains("Msg =:= increment"),
+            "missing increment case: {erl}"
+        );
         assert!(erl.contains("Msg =:= get"), "missing get case: {erl}");
     }
 
@@ -2044,16 +2130,28 @@ mod tests {
     fn genserver_default_handle_cast() {
         // genserver_source() has no handleCast → should get default
         let erl = compile_js(genserver_source());
-        assert!(erl.contains("handle_cast(_Msg, State) ->\n    {noreply, State}."), "missing default handle_cast: {erl}");
+        assert!(
+            erl.contains("handle_cast(_Msg, State) ->\n    {noreply, State}."),
+            "missing default handle_cast: {erl}"
+        );
     }
 
     #[test]
     fn genserver_custom_handle_cast() {
         let src = "const Counter = {\n  init: () => ({ count: 0 }),\n  handleCast: (msg, state) => {\n    if (msg === \"reset\") {\n      return { state: { count: 0 } }\n    }\n  }\n}\nconsole.log(\"hi\")";
         let erl = compile_js(src);
-        assert!(erl.contains("handle_cast(Msg, State) ->"), "missing handle_cast signature: {erl}");
-        assert!(erl.contains("#{state := __NewState}"), "missing map pattern match: {erl}");
-        assert!(erl.contains("{noreply, __NewState}"), "missing noreply tuple: {erl}");
+        assert!(
+            erl.contains("handle_cast(Msg, State) ->"),
+            "missing handle_cast signature: {erl}"
+        );
+        assert!(
+            erl.contains("#{state := __NewState}"),
+            "missing map pattern match: {erl}"
+        );
+        assert!(
+            erl.contains("{noreply, __NewState}"),
+            "missing noreply tuple: {erl}"
+        );
         assert!(erl.contains("{noreply, State}"), "missing fallback: {erl}");
     }
 
@@ -2062,7 +2160,10 @@ mod tests {
     #[test]
     fn genserver_default_handle_info() {
         let erl = compile_js(genserver_source());
-        assert!(erl.contains("handle_info(_Info, State) ->\n    {noreply, State}."), "missing default handle_info: {erl}");
+        assert!(
+            erl.contains("handle_info(_Info, State) ->\n    {noreply, State}."),
+            "missing default handle_info: {erl}"
+        );
     }
 
     // === GenServer start helper + integration ===
@@ -2070,8 +2171,14 @@ mod tests {
     #[test]
     fn genserver_start_helper_present() {
         let erl = compile_js(genserver_source());
-        assert!(erl.contains("juice_gen_server_start(Module) ->"), "missing start helper: {erl}");
-        assert!(erl.contains("gen_server:start_link(Module, [], [])"), "missing start_link: {erl}");
+        assert!(
+            erl.contains("juice_gen_server_start(Module) ->"),
+            "missing start helper: {erl}"
+        );
+        assert!(
+            erl.contains("gen_server:start_link(Module, [], [])"),
+            "missing start_link: {erl}"
+        );
     }
 
     #[test]
@@ -2084,22 +2191,49 @@ mod tests {
         assert!(erl.contains("handle_call/3"), "missing handle_call export");
         // Callbacks
         assert!(erl.contains("init(_Args) ->"), "missing init");
-        assert!(erl.contains("handle_call(Msg, _From, State) ->"), "missing handle_call");
-        assert!(erl.contains("handle_cast(_Msg, State) ->"), "missing default handle_cast");
+        assert!(
+            erl.contains("handle_call(Msg, _From, State) ->"),
+            "missing handle_call"
+        );
+        assert!(
+            erl.contains("handle_cast(_Msg, State) ->"),
+            "missing default handle_cast"
+        );
         // main/0
-        assert!(erl.contains("juice_gen_server_start(?MODULE)"), "missing start in main");
-        assert!(erl.contains("gen_server:call(Pid, increment)"), "missing call in main");
-        assert!(erl.contains("gen_server:call(Pid, get)"), "missing get call in main");
+        assert!(
+            erl.contains("juice_gen_server_start(?MODULE)"),
+            "missing start in main"
+        );
+        assert!(
+            erl.contains("gen_server:call(Pid, increment)"),
+            "missing call in main"
+        );
+        assert!(
+            erl.contains("gen_server:call(Pid, get)"),
+            "missing get call in main"
+        );
         // Helper
-        assert!(erl.contains("juice_gen_server_start(Module) ->"), "missing start helper");
+        assert!(
+            erl.contains("juice_gen_server_start(Module) ->"),
+            "missing start helper"
+        );
     }
 
     #[test]
     fn non_genserver_module_no_behaviour() {
         let erl = compile_js("console.log(\"hello\")");
-        assert!(!erl.contains("-behaviour"), "non-genserver should have no behaviour");
-        assert!(!erl.contains("init/1"), "non-genserver should have no init export");
-        assert!(!erl.contains("juice_gen_server_start"), "non-genserver should have no start helper");
+        assert!(
+            !erl.contains("-behaviour"),
+            "non-genserver should have no behaviour"
+        );
+        assert!(
+            !erl.contains("init/1"),
+            "non-genserver should have no init export"
+        );
+        assert!(
+            !erl.contains("juice_gen_server_start"),
+            "non-genserver should have no start helper"
+        );
     }
 
     // === Phase 4: Supervision ===
@@ -2129,11 +2263,20 @@ mod tests {
             ]
         })"#;
         let body = main_body(source);
-        assert!(body.contains("element(2, juice_supervisor:start_link("), "should unwrap {{ok, Pid}}");
-        assert!(body.contains("strategy => one_for_one"), "should have strategy");
+        assert!(
+            body.contains("element(2, juice_supervisor:start_link("),
+            "should unwrap {{ok, Pid}}"
+        );
+        assert!(
+            body.contains("strategy => one_for_one"),
+            "should have strategy"
+        );
         assert!(body.contains("intensity => 3"), "should have intensity 3");
         assert!(body.contains("id => counter"), "should have child id");
-        assert!(body.contains("start => {?MODULE, juice_gen_server_start_link, [?MODULE]}"), "should have MFA");
+        assert!(
+            body.contains("start => {?MODULE, juice_gen_server_start_link, [?MODULE]}"),
+            "should have MFA"
+        );
     }
 
     #[test]
@@ -2171,7 +2314,10 @@ mod tests {
             GenServer.call(pid, "boom")
         "#;
         let body = main_body(source);
-        assert!(body.contains("(catch gen_server:call(Pid, boom))"), "should wrap in catch: {body}");
+        assert!(
+            body.contains("(catch gen_server:call(Pid, boom))"),
+            "should wrap in catch: {body}"
+        );
     }
 
     #[test]
@@ -2203,8 +2349,14 @@ mod tests {
             })
         "#;
         let erl = compile_js(source);
-        assert!(erl.contains("juice_gen_server_start_link/1"), "should export start_link");
-        assert!(erl.contains("juice_gen_server_start_link(Module) ->"), "should have start_link helper");
+        assert!(
+            erl.contains("juice_gen_server_start_link/1"),
+            "should export start_link"
+        );
+        assert!(
+            erl.contains("juice_gen_server_start_link(Module) ->"),
+            "should have start_link helper"
+        );
     }
 
     #[test]
@@ -2216,7 +2368,10 @@ mod tests {
             ]
         })"#;
         let body = main_body(source);
-        assert!(body.contains("strategy => one_for_all"), "should have one_for_all strategy");
+        assert!(
+            body.contains("strategy => one_for_all"),
+            "should have one_for_all strategy"
+        );
     }
 
     #[test]
@@ -2239,7 +2394,10 @@ mod tests {
         let source = "console.log(\"hello\")";
         let parsed = Parser::new(&allocator, source, source_type).parse();
         let result = compile("test", &parsed.program);
-        assert!(!result.needs_supervisor, "should not set needs_supervisor flag");
+        assert!(
+            !result.needs_supervisor,
+            "should not set needs_supervisor flag"
+        );
     }
 
     // === Named GenServer ===
@@ -2315,6 +2473,9 @@ mod tests {
             ]
         })"#;
         let body = main_body(source);
-        assert!(body.contains("start_link_named, [?MODULE, counter]"), "should use named start_link: {body}");
+        assert!(
+            body.contains("start_link_named, [?MODULE, counter]"),
+            "should use named start_link: {body}"
+        );
     }
 }
