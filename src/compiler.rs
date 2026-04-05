@@ -698,6 +698,8 @@ fn compile_call(call: &CallExpression) -> Option<String> {
         compile_process_register(call)
     } else if is_process_whereis(call) {
         compile_process_whereis(call)
+    } else if is_process_info(call) {
+        compile_process_info(call)
     } else if is_node_connect(call) {
         compile_node_connect(call)
     } else if is_node_self(call) {
@@ -1111,6 +1113,23 @@ fn compile_process_whereis(call: &CallExpression) -> Option<String> {
     }
     let name = compile_argument(&call.arguments[0])?;
     Some(format!("erlang:whereis({name})"))
+}
+
+fn is_process_info(call: &CallExpression) -> bool {
+    if let Expression::StaticMemberExpression(member) = &call.callee {
+        if let Expression::Identifier(obj) = &member.object {
+            return obj.name == "Process" && member.property.name == "info";
+        }
+    }
+    false
+}
+
+fn compile_process_info(call: &CallExpression) -> Option<String> {
+    if call.arguments.len() != 1 {
+        return None;
+    }
+    let pid = compile_argument(&call.arguments[0])?;
+    Some(format!("erlang:process_info({pid})"))
 }
 
 fn is_node_connect(call: &CallExpression) -> bool {
@@ -2523,6 +2542,14 @@ mod tests {
         assert_eq!(
             main_body("Process.whereis(\"counter\")"),
             "erlang:whereis(counter)"
+        );
+    }
+
+    #[test]
+    fn process_info() {
+        assert_eq!(
+            main_body("Process.info(pid)"),
+            "erlang:process_info(Pid)"
         );
     }
 

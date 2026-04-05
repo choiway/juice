@@ -89,3 +89,86 @@ hello?
 No `"got: hello?"` — the message just echoes back. The process is gone.
 
 This is the core of the BEAM: a process is a function with its own mailbox and address. You create them with `spawn`, talk to them with `send`, and they listen with `receive`.
+
+## Process utilities
+
+Juice exposes a `Process` module for managing processes beyond the basics.
+
+### Process.info
+
+On the BEAM, a process doesn't have a state object you can inspect from the outside. State lives in the arguments of the recursive function call — it's private to the process. To make state visible, you build it into the message protocol: the process responds to a query.
+
+Here's a counter that tracks its own state and can report it back:
+
+```
+box> const counter = (count) => {
+  receive((msg) => {
+    if (msg === "inc") {
+      counter(count + 1)
+    } else if (msg === "dec") {
+      counter(count - 1)
+    } else {
+      send(msg, count)
+      counter(count)
+    }
+  })
+}
+box> const pid = spawn(() => { counter(0) })
+<0.84.0>
+box> send(pid, "inc")
+box> send(pid, "inc")
+box> send(pid, "inc")
+box> send(pid, self())
+3
+```
+
+When the process receives a pid instead of a command, it sends its current count back. The caller gets the state by asking for it — there's no way to peek inside a process without its cooperation.
+
+`Process.info(pid)` gives you VM-level metadata — whether the process is alive, what it's doing, how many messages are queued:
+
+```
+box> Process.info(pid)
+```
+
+Useful fields:
+
+- `status` — `waiting` (blocked in receive), `running`, `runnable`
+- `message_queue_len` — messages sitting in the mailbox, not yet received
+- `messages` — the actual queued messages
+- `links` — other processes linked to this one (if one crashes, the linked process gets notified)
+
+This is a debugging tool, not a way to read state. If a process seems stuck, `Process.info` tells you whether it's alive, whether messages are piling up, and whether it's actually waiting in `receive`.
+
+### Process.register and Process.whereis
+
+Every process gets a pid when it's spawned, but pids are temporary — they change every time you restart a process. `Process.register` gives a process a name so other processes can find it without knowing the pid:
+
+```
+box> const loop = () => { receive((msg) => { console.log("got: " + msg); loop() }) }
+box> const pid = spawn(loop)
+<0.84.0>
+box> Process.register("greeter", pid)
+true
+```
+
+Now any process can look it up by name:
+
+```
+box> const found = Process.whereis("greeter")
+<0.84.0>
+box> send(found, "hello")
+got: hello
+```
+
+`Process.whereis` returns the pid for a registered name, or `undefined` if nothing is registered under that name. This is how services find each other on the BEAM — instead of passing pids around, you register a name and let callers look it up.
+
+### Process.exit
+
+As shown earlier, `Process.exit(pid, reason)` kills a process:
+
+```
+box> Process.exit(pid, "kill")
+true
+```
+
+The reason `"kill"` is special — it's an unconditional kill that can't be trapped. Other reasons (like `"normal"` or `"shutdown"`) can be intercepted by processes that set `trap_exit` to true, which is how supervisors know when their children crash.
