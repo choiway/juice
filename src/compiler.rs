@@ -119,18 +119,22 @@ pub fn compile(module_name: &str, program: &Program) -> CompileResult {
     }
 
     if genserver.is_some() {
-        output.push('\n');
-        output.push_str(&erlang::gen_server_start_helper());
-        output.push('\n');
+        if body.contains("juice_gen_server_start(") {
+            output.push('\n');
+            output.push_str(&erlang::gen_server_start_helper());
+            output.push('\n');
+        }
         if needs_supervisor {
             output.push('\n');
             output.push_str(&erlang::gen_server_start_link_helper());
             output.push('\n');
         }
-        if uses_named_genserver {
+        if body.contains("juice_gen_server_start_named(") {
             output.push('\n');
             output.push_str(&erlang::gen_server_start_named_helper());
             output.push('\n');
+        }
+        if uses_named_genserver && needs_supervisor {
             output.push('\n');
             output.push_str(&erlang::gen_server_start_link_named_helper());
             output.push('\n');
@@ -350,6 +354,16 @@ fn compile_declarator(decl: &VariableDeclarator) -> Option<String> {
     };
 
     let init = decl.init.as_ref()?;
+
+    // Supervisor.start() result is typically unused — prefix with _ to suppress Erlang warning
+    if let Expression::CallExpression(call) = init {
+        if is_supervisor_start(call) {
+            let value = compile_supervisor_start(call)?;
+            let erl_name = erlang::js_var_to_erlang(name);
+            return Some(format!("_{erl_name} = {value}"));
+        }
+    }
+
     let value = compile_expression(init)?;
 
     let erl_name = erlang::js_var_to_erlang(name);
