@@ -84,6 +84,11 @@ pub fn fun_expression(params: &[String], body: &str) -> String {
     format!("fun({params_str}) ->\n        {body}\n    end")
 }
 
+pub fn named_fun_expression(name: &str, params: &[String], body: &str) -> String {
+    let params_str = params.join(", ");
+    format!("fun {name}({params_str}) ->\n        {body}\n    end")
+}
+
 pub fn spawn_call(fun_expr: &str) -> String {
     format!("erlang:spawn({fun_expr})")
 }

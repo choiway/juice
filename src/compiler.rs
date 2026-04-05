@@ -354,19 +354,37 @@ fn compile_declarator(decl: &VariableDeclarator) -> Option<String> {
     };
 
     let init = decl.init.as_ref()?;
+    let erl_name = erlang::js_var_to_erlang(name);
 
     // Supervisor.start() result is typically unused — prefix with _ to suppress Erlang warning
     if let Expression::CallExpression(call) = init {
         if is_supervisor_start(call) {
             let value = compile_supervisor_start(call)?;
-            let erl_name = erlang::js_var_to_erlang(name);
             return Some(format!("_{erl_name} = {value}"));
         }
     }
 
-    let value = compile_expression(init)?;
+    // Arrow function assignment gets a named fun so it can call itself recursively
+    if let Expression::ArrowFunctionExpression(arrow) = init {
+        let params: Vec<String> = arrow
+            .params
+            .items
+            .iter()
+            .filter_map(|param| match &param.pattern {
+                BindingPattern::BindingIdentifier(ident) => {
+                    Some(erlang::js_var_to_erlang(&ident.name))
+                }
+                _ => None,
+            })
+            .collect();
+        let body = compile_function_body(&arrow.body)?;
+        return Some(format!(
+            "{erl_name} = {}",
+            erlang::named_fun_expression(&erl_name, &params, &body)
+        ));
+    }
 
-    let erl_name = erlang::js_var_to_erlang(name);
+    let value = compile_expression(init)?;
     Some(format!("{erl_name} = {value}"))
 }
 
@@ -443,7 +461,7 @@ fn compile_function_declaration(func: &Function) -> Option<String> {
         })
         .collect();
     let body = compile_function_body(func.body.as_ref()?)?;
-    Some(format!("{name} = {}", erlang::fun_expression(&params, &body)))
+    Some(format!("{name} = {}", erlang::named_fun_expression(&name, &params, &body)))
 }
 
 fn compile_arrow_function(arrow: &ArrowFunctionExpression) -> Option<String> {
@@ -1346,7 +1364,7 @@ mod tests {
     fn arrow_function_no_params() {
         assert_eq!(
             main_body("const f = () => { console.log(42) }"),
-            "F = fun() ->\n        io:format(\"~p~n\", [42])\n    end"
+            "F = fun F() ->\n        io:format(\"~p~n\", [42])\n    end"
         );
     }
 
@@ -1354,7 +1372,7 @@ mod tests {
     fn arrow_function_one_param() {
         assert_eq!(
             main_body("const greet = (name) => { console.log(name) }"),
-            "Greet = fun(Name) ->\n        io:format(\"~p~n\", [Name])\n    end"
+            "Greet = fun Greet(Name) ->\n        io:format(\"~p~n\", [Name])\n    end"
         );
     }
 
@@ -1362,7 +1380,7 @@ mod tests {
     fn arrow_function_multiple_params() {
         assert_eq!(
             main_body("const add = (a, b) => { console.log(a + b) }"),
-            "Add = fun(A, B) ->\n        io:format(\"~p~n\", [(A + B)])\n    end"
+            "Add = fun Add(A, B) ->\n        io:format(\"~p~n\", [(A + B)])\n    end"
         );
     }
 
@@ -1370,7 +1388,7 @@ mod tests {
     fn arrow_function_expression_body() {
         assert_eq!(
             main_body("const inc = (x) => x + 1"),
-            "Inc = fun(X) ->\n        (X + 1)\n    end"
+            "Inc = fun Inc(X) ->\n        (X + 1)\n    end"
         );
     }
 
@@ -1378,7 +1396,7 @@ mod tests {
     fn arrow_function_multi_statement_body() {
         assert_eq!(
             main_body("const f = () => { const x = 1\nconsole.log(x) }"),
-            "F = fun() ->\n        X = 1,\n        io:format(\"~p~n\", [X])\n    end"
+            "F = fun F() ->\n        X = 1,\n        io:format(\"~p~n\", [X])\n    end"
         );
     }
 
@@ -1386,7 +1404,7 @@ mod tests {
     fn arrow_function_empty_body() {
         assert_eq!(
             main_body("const f = () => {}"),
-            "F = fun() ->\n        ok\n    end"
+            "F = fun F() ->\n        ok\n    end"
         );
     }
 
@@ -1394,7 +1412,7 @@ mod tests {
     fn repl_arrow_function_var() {
         assert_eq!(
             repl_compile("const greet = (name) => { console.log(name) }"),
-            vec!["Greet = fun(Name) ->\n        io:format(\"~p~n\", [Name])\n    end"]
+            vec!["Greet = fun Greet(Name) ->\n        io:format(\"~p~n\", [Name])\n    end"]
         );
     }
 
@@ -1402,7 +1420,7 @@ mod tests {
     fn function_call_no_args() {
         assert_eq!(
             main_body("const f = () => { console.log(42) }\nf()"),
-            "F = fun() ->\n        io:format(\"~p~n\", [42])\n    end,\n    F()"
+            "F = fun F() ->\n        io:format(\"~p~n\", [42])\n    end,\n    F()"
         );
     }
 
@@ -1410,7 +1428,7 @@ mod tests {
     fn function_call_one_arg() {
         assert_eq!(
             main_body("const greet = (name) => { console.log(name) }\ngreet(\"hello\")"),
-            "Greet = fun(Name) ->\n        io:format(\"~p~n\", [Name])\n    end,\n    Greet(hello)"
+            "Greet = fun Greet(Name) ->\n        io:format(\"~p~n\", [Name])\n    end,\n    Greet(hello)"
         );
     }
 
@@ -1418,7 +1436,7 @@ mod tests {
     fn function_call_multiple_args() {
         assert_eq!(
             main_body("const add = (a, b) => { console.log(a + b) }\nadd(1, 2)"),
-            "Add = fun(A, B) ->\n        io:format(\"~p~n\", [(A + B)])\n    end,\n    Add(1, 2)"
+            "Add = fun Add(A, B) ->\n        io:format(\"~p~n\", [(A + B)])\n    end,\n    Add(1, 2)"
         );
     }
 
@@ -1426,7 +1444,7 @@ mod tests {
     fn function_call_with_expression_arg() {
         assert_eq!(
             main_body("const f = (x) => { console.log(x) }\nf(1 + 2)"),
-            "F = fun(X) ->\n        io:format(\"~p~n\", [X])\n    end,\n    F((1 + 2))"
+            "F = fun F(X) ->\n        io:format(\"~p~n\", [X])\n    end,\n    F((1 + 2))"
         );
     }
 
@@ -1434,7 +1452,7 @@ mod tests {
     fn function_call_with_variable_arg() {
         assert_eq!(
             main_body("const x = 10\nconst f = (n) => { console.log(n) }\nf(x)"),
-            "X = 10,\n    F = fun(N) ->\n        io:format(\"~p~n\", [N])\n    end,\n    F(X)"
+            "X = 10,\n    F = fun F(N) ->\n        io:format(\"~p~n\", [N])\n    end,\n    F(X)"
         );
     }
 
@@ -1442,7 +1460,7 @@ mod tests {
     fn console_log_nested_function_call() {
         assert_eq!(
             main_body("const inc = (x) => x + 1\nconsole.log(inc(5))"),
-            "Inc = fun(X) ->\n        (X + 1)\n    end,\n    io:format(\"~p~n\", [Inc(5)])"
+            "Inc = fun Inc(X) ->\n        (X + 1)\n    end,\n    io:format(\"~p~n\", [Inc(5)])"
         );
     }
 
@@ -1451,7 +1469,7 @@ mod tests {
         assert_eq!(
             repl_compile("const inc = (x) => x + 1\ninc(5)"),
             vec![
-                "Inc = fun(X) ->\n        (X + 1)\n    end",
+                "Inc = fun Inc(X) ->\n        (X + 1)\n    end",
                 "io:format(\"~p~n\", [Inc(5)])"
             ]
         );
@@ -1723,7 +1741,7 @@ mod tests {
     fn atom_in_function_call() {
         assert_eq!(
             main_body("const greet = (name) => { console.log(name) }\ngreet(\"hello\")"),
-            "Greet = fun(Name) ->\n        io:format(\"~p~n\", [Name])\n    end,\n    Greet(hello)"
+            "Greet = fun Greet(Name) ->\n        io:format(\"~p~n\", [Name])\n    end,\n    Greet(hello)"
         );
     }
 
@@ -1875,7 +1893,7 @@ mod tests {
     fn template_literal_in_arrow() {
         assert_eq!(
             main_body("const f = (x) => `val: ${x}`"),
-            "F = fun(X) ->\n        lists:flatten([\"val: \", juice_to_string(X)])\n    end"
+            "F = fun F(X) ->\n        lists:flatten([\"val: \", juice_to_string(X)])\n    end"
         );
     }
 
@@ -1964,7 +1982,7 @@ mod tests {
     fn object_in_arrow_return() {
         assert_eq!(
             main_body("const init = () => ({ count: 0 })"),
-            "Init = fun() ->\n        #{count => 0}\n    end"
+            "Init = fun Init() ->\n        #{count => 0}\n    end"
         );
     }
 
@@ -2051,7 +2069,7 @@ mod tests {
     fn return_expression() {
         assert_eq!(
             main_body("const f = (x) => { return x + 1 }"),
-            "F = fun(X) ->\n        (X + 1)\n    end"
+            "F = fun F(X) ->\n        (X + 1)\n    end"
         );
     }
 
@@ -2059,7 +2077,7 @@ mod tests {
     fn return_object() {
         assert_eq!(
             main_body("const f = () => { return { count: 0 } }"),
-            "F = fun() ->\n        #{count => 0}\n    end"
+            "F = fun F() ->\n        #{count => 0}\n    end"
         );
     }
 
@@ -2067,7 +2085,7 @@ mod tests {
     fn return_bare() {
         assert_eq!(
             main_body("const f = () => { return }"),
-            "F = fun() ->\n        ok\n    end"
+            "F = fun F() ->\n        ok\n    end"
         );
     }
 
