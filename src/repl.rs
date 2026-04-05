@@ -241,6 +241,42 @@ fn friendly_erl_error(raw: &str) -> String {
         .to_string()
 }
 
+pub fn format_parse_error(source: &str, error: &oxc_diagnostics::OxcDiagnostic) -> String {
+    let mut out = String::new();
+
+    if let Some(labels) = &error.labels {
+        if let Some(label) = labels.first() {
+            let offset = label.offset();
+            // Find which line the error is on and the column within it
+            let mut line_start = 0;
+            let mut line_num = 1;
+            for (i, ch) in source.char_indices() {
+                if i >= offset {
+                    break;
+                }
+                if ch == '\n' {
+                    line_start = i + 1;
+                    line_num += 1;
+                }
+            }
+            let col = offset - line_start;
+            let error_line = source[line_start..].lines().next().unwrap_or("");
+
+            if source.contains('\n') {
+                out.push_str(&format!("  {} | {}\n", line_num, error_line));
+                let pad = format!("{}", line_num).len() + 3;
+                out.push_str(&format!("{}{}\n", " ".repeat(pad + col), "^"));
+            } else {
+                out.push_str(&format!("  {}\n", error_line));
+                out.push_str(&format!("  {}{}\n", " ".repeat(col), "^"));
+            }
+        }
+    }
+
+    out.push_str(&format!("{error}"));
+    out
+}
+
 pub fn run() {
     println!("box v0.1.0 - juice interactive shell");
     println!("Type a JS expression. Ctrl+D to exit.");
@@ -330,7 +366,7 @@ pub fn run() {
             {
                 continue;
             }
-            eprintln!("Parse error: {}", parser_return.errors[0]);
+            eprint!("{}", format_parse_error(&buffer, &parser_return.errors[0]));
             buffer.clear();
             continue;
         }
@@ -608,7 +644,7 @@ pub fn run_persistent(module_name: &str, node_name: Option<&str>, beam_dir: &str
             {
                 continue;
             }
-            eprintln!("Parse error: {}", parser_return.errors[0]);
+            eprint!("{}", format_parse_error(&buffer, &parser_return.errors[0]));
             buffer.clear();
             continue;
         }
@@ -818,7 +854,7 @@ pub fn run_connect(target_node: &str) {
             {
                 continue;
             }
-            eprintln!("Parse error: {}", parser_return.errors[0]);
+            eprint!("{}", format_parse_error(&buffer, &parser_return.errors[0]));
             buffer.clear();
             continue;
         }

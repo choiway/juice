@@ -61,3 +61,53 @@ It's worth breaking down this `erl` command because it will come up again as the
 That last flag is the interesting one. Without it, the BEAM stays running — because the BEAM is designed to run forever. It's not a program executor like Node or Python where a script runs and exits. It's a runtime for long-lived concurrent systems. Every piece of code runs inside a lightweight **process**, and the VM is built to keep those processes alive, supervised, and talking to each other.
 
 For this hello world example, there's nothing to keep alive, so we tell it to stop. But as we get into processes and message passing, you'll see why "the VM stays running" is a feature, not a bug.
+
+## Processes
+
+Juice has an interactive shell. Start it with `juice box`:
+
+```
+$ juice box
+```
+
+Define a function:
+
+```
+box> const greet = () => { console.log("hello") }
+```
+
+Call it:
+
+```
+box> greet()
+hello
+```
+
+Now pass the same function to `spawn`:
+
+```
+box> const pid = spawn(greet)
+hello
+<0.84.0>
+```
+
+`spawn` created a new BEAM process, ran `greet` inside it, and returned the process ID — a pid. The function ran, printed "hello", and the process exited.
+
+The pid `<0.84.0>` is an address. But this process is already gone — it did its work and disappeared. To make a process that sticks around, give it something to wait for:
+
+```
+box> const listener = () => { receive((msg) => { console.log("got: " + msg) }) }
+box> const pid2 = spawn(listener)
+<0.85.0>
+```
+
+Nothing printed. The process is alive and waiting inside `receive` for a message. Send it one using the pid:
+
+```
+box> send(pid2, "hello")
+got: hello
+```
+
+The process received `"hello"`, ran the callback, and printed `"got: hello"`.
+
+This is the core of the BEAM: a process is a function with its own mailbox and address. You create them with `spawn`, talk to them with `send`, and they listen with `receive`.

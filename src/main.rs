@@ -122,7 +122,7 @@ fn compile_and_prepare(input_path: &Path, flags: &Flags) -> String {
 
     if !parser_return.errors.is_empty() {
         for error in &parser_return.errors {
-            eprintln!("Parse error: {error}");
+            eprint!("{}", repl::format_parse_error(&source, error));
         }
         std::process::exit(1);
     }
@@ -309,7 +309,8 @@ fn compile_project() -> (String, PathBuf) {
 
         if !parser_return.errors.is_empty() {
             for error in &parser_return.errors {
-                eprintln!("Parse error in {}: {error}", ts_path.display());
+                eprintln!("{}:", ts_path.display());
+                eprint!("{}", repl::format_parse_error(&source, error));
             }
             std::process::exit(1);
         }
