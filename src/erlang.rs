@@ -279,7 +279,14 @@ pub fn gen_server_start_link_named_helper() -> String {
 
 pub fn shell_module() -> String {
     "-module(juice_shell).\n\
-     -export([start/1, remote_eval/1]).\n\
+     -export([start/0, start/1, remote_eval/1]).\n\
+     \n\
+     start() ->\n    \
+         process_flag(trap_exit, true),\n    \
+         register(juice_shell, self()),\n    \
+         Shell = self(),\n    \
+         spawn_link(fun() -> stdin_reader(Shell) end),\n    \
+         loop(erl_eval:new_bindings()).\n\
      \n\
      start([UserModule]) ->\n    \
          process_flag(trap_exit, true),\n    \

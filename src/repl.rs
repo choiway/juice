@@ -246,13 +246,49 @@ pub fn run() {
     println!("Type a JS expression. Ctrl+D to exit.");
     println!();
 
+    let mut cmd = Command::new("erl");
+    cmd.arg("-noshell")
+        .arg("-pa")
+        .arg(".")
+        .arg("-s")
+        .arg("juice_shell")
+        .arg("start")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("Error starting Erlang VM: {e}");
+        std::process::exit(1);
+    });
+
+    let child_stdin = child.stdin.take().expect("Failed to open stdin");
+    let child_stdout = child.stdout.take().expect("Failed to open stdout");
+
+    let (result_tx, result_rx) = mpsc::channel::<ShellMessage>();
+    start_reader_thread(child_stdout, result_tx);
+
+    thread::sleep(std::time::Duration::from_millis(300));
+
+    // Set up JuiceToString helper in the eval server's bindings
+    let mut erl_stdin = child_stdin;
+    {
+        use io::Write as _;
+        let to_string_def = "JuiceToString = fun(V) when is_integer(V) -> integer_to_list(V); (V) when is_float(V) -> float_to_list(V, [{decimals, 10}, compact]); (V) when is_atom(V) -> atom_to_list(V); (V) when is_list(V) -> V; (V) -> lists:flatten(io_lib:format(\"~p\", [V])) end";
+        if writeln!(erl_stdin, "{to_string_def}").is_err() {
+            eprintln!("VM process exited");
+            std::process::exit(1);
+        }
+        let _ = erl_stdin.flush();
+        let _ = result_rx.recv();
+    }
+
     let mut rl = Editor::<JsHelper, DefaultHistory>::new().expect("Failed to initialize editor");
     rl.set_helper(Some(JsHelper));
     let hist = history_path();
     let _ = rl.load_history(&hist);
 
     let mut buffer = String::new();
-    let mut erl_defs: Vec<String> = Vec::new();
 
     loop {
         let prompt = if buffer.is_empty() { "box> " } else { "...> " };
@@ -302,60 +338,50 @@ pub fn run() {
         let input_source = buffer.clone();
 
         let mut exprs: Vec<String> = Vec::new();
-        let mut new_defs: Vec<String> = Vec::new();
         for stmt in &parser_return.program.body {
-            if let Some(erl) = compiler::compile_stmt_repl(stmt) {
+            if let Some(erl) = compiler::compile_stmt_persistent_repl(stmt) {
                 exprs.push(erl);
             } else {
                 eprintln!("Unsupported statement");
             }
-            if matches!(stmt, oxc_ast::ast::Statement::VariableDeclaration(_)) {
-                if let Some(def) = compiler::compile_stmt(stmt) {
-                    new_defs.push(def);
-                }
-            }
         }
-
         buffer.clear();
 
-        if !exprs.is_empty() {
-            let mut all_exprs = erl_defs.clone();
-            all_exprs.extend(exprs);
-            let to_string_fun = "JuiceToString = fun(V) when is_integer(V) -> integer_to_list(V); (V) when is_float(V) -> float_to_list(V, [{decimals, 10}, compact]); (V) when is_atom(V) -> atom_to_list(V); (V) when is_list(V) -> V; (V) -> lists:flatten(io_lib:format(\"~p\", [V])) end";
-            let mut eval_parts = vec![to_string_fun.to_string()];
-            let rewritten: Vec<String> = all_exprs
-                .iter()
-                .map(|e| e.replace("juice_to_string(", "JuiceToString("))
-                .collect();
-            eval_parts.extend(rewritten);
-            let eval_str = format!("{}, halt().", eval_parts.join(", "));
-            let output = Command::new("erl")
-                .arg("-eval")
-                .arg(&eval_str)
-                .arg("-noshell")
-                .env("ERL_CRASH_DUMP", "/dev/null")
-                .output();
-
-            match output {
-                Ok(out) => {
-                    if !out.stdout.is_empty() {
-                        print!("\x1b[36m{}\x1b[0m", String::from_utf8_lossy(&out.stdout));
-                    }
-                    if !out.status.success() {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        eprintln!("\x1b[31mError: {}\x1b[0m", friendly_erl_error(&stderr));
-                    } else {
-                        erl_defs.extend(new_defs);
-                    }
-                }
-                Err(e) => eprintln!("Error running erl: {e}"),
-            }
-
-            let _ = rl.add_history_entry(&input_source);
+        if exprs.is_empty() {
+            continue;
         }
+
+        let eval_str = exprs.join(", ")
+            .replace("juice_to_string(", "JuiceToString(")
+            .replace('\n', " ");
+        use io::Write as _;
+        if writeln!(erl_stdin, "{eval_str}").is_err() {
+            eprintln!("VM process exited");
+            break;
+        }
+        if erl_stdin.flush().is_err() {
+            eprintln!("VM process exited");
+            break;
+        }
+
+        match result_rx.recv() {
+            Ok(ShellMessage::Result(value)) => {
+                println!("\x1b[36m{value}\x1b[0m");
+            }
+            Ok(ShellMessage::Error(err)) => {
+                eprintln!("\x1b[31mError: {}\x1b[0m", friendly_erl_error(&err));
+            }
+            Err(_) => {
+                eprintln!("VM process exited");
+                break;
+            }
+        }
+
+        let _ = rl.add_history_entry(&input_source);
     }
 
     let _ = rl.save_history(&hist);
+    let _ = child.wait();
     println!("Goodbye!");
 }
 
@@ -491,7 +517,7 @@ fn start_reader_thread(mut stdout: std::process::ChildStdout, tx: mpsc::Sender<S
 
 /// Run a persistent REPL connected to a long-running Erlang VM.
 /// The VM starts the user's supervision tree, then accepts eval requests.
-pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
+pub fn run_persistent(module_name: &str, node_name: Option<&str>, beam_dir: &str) {
     let prompt = match node_name {
         Some(name) => format!("juice@{name}> "),
         None => "juice> ".to_string(),
@@ -500,7 +526,7 @@ pub fn run_persistent(module_name: &str, node_name: Option<&str>) {
     let mut cmd = Command::new("erl");
     cmd.arg("-noshell")
         .arg("-pa")
-        .arg(".")
+        .arg(beam_dir)
         .arg("-kernel")
         .arg("logger")
         .arg("[{handler, default, logger_std_h, #{config => #{type => standard_error}}}]")

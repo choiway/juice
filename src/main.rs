@@ -66,7 +66,10 @@ fn main() {
     }
 
     match positional[0].as_str() {
-        "box" => repl::run(),
+        "box" => {
+            write_and_compile_erl("juice_shell", &erlang::shell_module());
+            repl::run();
+        }
         "new" => {
             if positional.len() < 2 {
                 eprintln!("Usage: juice new <project-name>");
