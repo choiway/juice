@@ -17,6 +17,7 @@ use rustyline::history::DefaultHistory;
 use rustyline::{Editor, Helper};
 
 use crate::compiler;
+use crate::erlang;
 
 struct JsHelper;
 
@@ -306,12 +307,28 @@ pub fn run() {
 
     thread::sleep(std::time::Duration::from_millis(300));
 
-    // Set up JuiceToString helper in the eval server's bindings
+    // Set up helper funs in the eval server's bindings
     let mut erl_stdin = child_stdin;
     {
         use io::Write as _;
         let to_string_def = "JuiceToString = fun(V) when is_integer(V) -> integer_to_list(V); (V) when is_float(V) -> float_to_list(V, [{decimals, 10}, compact]); (V) when is_atom(V) -> atom_to_list(V); (V) when is_list(V) -> V; (V) -> lists:flatten(io_lib:format(\"~p\", [V])) end";
         if writeln!(erl_stdin, "{to_string_def}").is_err() {
+            eprintln!("VM process exited");
+            std::process::exit(1);
+        }
+        let _ = erl_stdin.flush();
+        let _ = result_rx.recv();
+
+        let gen_start_def = "JuiceGenServerStart = fun(Module) -> {ok, Pid} = gen_server:start_link(Module, [], []), Pid end";
+        if writeln!(erl_stdin, "{gen_start_def}").is_err() {
+            eprintln!("VM process exited");
+            std::process::exit(1);
+        }
+        let _ = erl_stdin.flush();
+        let _ = result_rx.recv();
+
+        let gen_start_named_def = "JuiceGenServerStartNamed = fun(Module, Name) -> {ok, Pid} = gen_server:start_link({local, Name}, Module, [], []), Pid end";
+        if writeln!(erl_stdin, "{gen_start_named_def}").is_err() {
             eprintln!("VM process exited");
             std::process::exit(1);
         }
@@ -373,9 +390,34 @@ pub fn run() {
 
         let input_source = buffer.clone();
 
+        let mut load_exprs: Vec<String> = Vec::new();
         let mut exprs: Vec<String> = Vec::new();
+        let mut had_error = false;
         for stmt in &parser_return.program.body {
-            if let Some(erl) = compiler::compile_stmt_persistent_repl(stmt) {
+            if let Some(var_name) = compiler::is_genserver_definition(stmt) {
+                let module_name = var_name.to_lowercase();
+                if let Some(module_source) =
+                    compiler::compile_genserver_to_module(&module_name, stmt)
+                {
+                    let erl_path = format!("{module_name}.erl");
+                    if std::fs::write(&erl_path, &module_source).is_ok() {
+                        let status = Command::new("erlc").arg(&erl_path).status();
+                        let _ = std::fs::remove_file(&erl_path);
+                        if status.is_ok_and(|s| s.success()) {
+                            let erl_var = erlang::js_var_to_erlang(&var_name);
+                            load_exprs.push(format!(
+                                "code:purge({module_name}), code:load_file({module_name}), {erl_var} = {module_name}"
+                            ));
+                        } else {
+                            eprintln!("Failed to compile GenServer module");
+                            had_error = true;
+                        }
+                    } else {
+                        eprintln!("Failed to write GenServer module");
+                        had_error = true;
+                    }
+                }
+            } else if let Some(erl) = compiler::compile_stmt_persistent_repl(stmt) {
                 exprs.push(erl);
             } else {
                 eprintln!("Unsupported statement");
@@ -383,12 +425,21 @@ pub fn run() {
         }
         buffer.clear();
 
-        if exprs.is_empty() {
+        if had_error {
             continue;
         }
 
-        let eval_str = exprs.join(", ")
+        let mut all_exprs = load_exprs;
+        all_exprs.extend(exprs);
+
+        if all_exprs.is_empty() {
+            continue;
+        }
+
+        let eval_str = all_exprs.join(", ")
             .replace("juice_to_string(", "JuiceToString(")
+            .replace("juice_gen_server_start_named(", "JuiceGenServerStartNamed(")
+            .replace("juice_gen_server_start(", "JuiceGenServerStart(")
             .replace('\n', " ");
         use io::Write as _;
         if writeln!(erl_stdin, "{eval_str}").is_err() {

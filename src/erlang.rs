@@ -117,6 +117,24 @@ pub fn receive_expression(pattern: &str, body: &str) -> String {
     format!("receive\n            {pattern} ->\n                {body}\n        end")
 }
 
+pub fn match_clause(pattern: &str, body: &str) -> String {
+    format!("{pattern} ->\n        {body}")
+}
+
+pub fn match_expression(value: &str, clauses: &[String]) -> String {
+    let body = clauses.join(";\n        ");
+    format!("case {value} of\n        {body}\n    end")
+}
+
+pub fn receive_clause(pattern: &str, body: &str) -> String {
+    format!("{pattern} ->\n                {body}")
+}
+
+pub fn receive_multi_expression(clauses: &[String]) -> String {
+    let body = clauses.join(";\n            ");
+    format!("receive\n            {body}\n        end")
+}
+
 pub fn to_string_helper() -> String {
     "juice_to_string(V) when is_integer(V) -> integer_to_list(V);\n\
      juice_to_string(V) when is_float(V) -> float_to_list(V, [{decimals, 10}, compact]);\n\
@@ -208,6 +226,40 @@ pub fn handle_cast_function(msg_param: &str, state_param: &str, body: &str) -> S
 
 pub fn default_handle_cast() -> String {
     "handle_cast(_Msg, State) ->\n    {noreply, State}.".to_string()
+}
+
+pub fn handle_call_clause(pattern: &str, state_param: &str, body: &str) -> String {
+    format!(
+        "handle_call({pattern}, _From, {state_param}) ->\n    \
+         __Result = begin {body} end,\n    \
+         case __Result of\n        \
+         #{{reply := __Reply, state := __NewState}} ->\n            \
+         {{reply, __Reply, __NewState}};\n        \
+         _ ->\n            \
+         {{reply, {{error, unhandled}}, {state_param}}}\n    \
+         end"
+    )
+}
+
+pub fn handle_call_default_clause() -> String {
+    "handle_call(_Msg, _From, State) ->\n    {reply, {error, unhandled}, State}".to_string()
+}
+
+pub fn handle_cast_clause(pattern: &str, state_param: &str, body: &str) -> String {
+    format!(
+        "handle_cast({pattern}, {state_param}) ->\n    \
+         __Result = begin {body} end,\n    \
+         case __Result of\n        \
+         #{{state := __NewState}} ->\n            \
+         {{noreply, __NewState}};\n        \
+         _ ->\n            \
+         {{noreply, {state_param}}}\n    \
+         end"
+    )
+}
+
+pub fn handle_cast_default_clause() -> String {
+    "handle_cast(_Msg, State) ->\n    {noreply, State}".to_string()
 }
 
 pub fn default_handle_info() -> String {
